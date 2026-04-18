@@ -9,6 +9,10 @@ book:
   site-url: https://mlops-notes-lightbridge.netlify.app
   chapters:
     - index.qmd
+    - part: Data Format
+      chapters: 
+        - text: Highdicom vs Pydicom
+          href: "contents/datatypes/highdicom-vs-pydicom.qmd"
     - part: Model Format
       chapters: 
         - text: ".pt, .ts, .onnx"

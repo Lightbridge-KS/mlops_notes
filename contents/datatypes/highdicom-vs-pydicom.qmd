@@ -1,0 +1,203 @@
+---
+title: "highdicom vs pydicom"
+---
+
+
+
+These two packages are closely related but operate at very different levels of abstraction. Let me break it down.
+
+## The Core Difference
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Your Application (AI models, analysis tools)       │
+├─────────────────────────────────────────────────────┤
+│  highdicom  ← High-level: IODs, SOP Classes,        │
+│              structured content, domain concepts    │
+├─────────────────────────────────────────────────────┤
+│  pydicom    ← Low-level: Dataset, DataElement,      │
+│              tags, VRs, file I/O                    │
+├─────────────────────────────────────────────────────┤
+│  DICOM Binary Files (.dcm)                          │
+└─────────────────────────────────────────────────────┘
+```
+
+**`pydicom`** is the foundational library — it reads, writes, and manipulates DICOM files at the **tag/element level**. You work with `Dataset` objects and set individual tags like `(0010,0010) PatientName`.
+
+**`highdicom`** is built *on top of* pydicom. It provides **domain-aware abstractions** for creating standards-compliant DICOM objects — things like Segmentations, Structured Reports, Parametric Maps, and annotations — without you having to know every required tag in the relevant IOD (Information Object Definition).
+
+## Analogy
+
+Think of it like this:
+
+```
+pydicom    ≈ Working with raw HTML tags (<div>, <span>, attributes)
+highdicom  ≈ Working with a React component library
+             (pre-built, validated, composable widgets)
+```
+
+With pydicom, *you* are responsible for ensuring your DICOM file conforms to the standard. With highdicom, the library enforces conformance for specific SOP Classes by construction.
+
+## What pydicom Does Well
+
+- Reading any DICOM file into a `Dataset`
+- Getting/setting individual tags by keyword or tag number
+- Handling transfer syntaxes, pixel data decoding (with plugins like `pylibjpeg`, `gdcm`)
+- Writing modified files back to disk
+- DICOM networking via `pynetdicom` (sister project)
+
+```python
+import pydicom
+
+ds = pydicom.dcmread("image.dcm")
+print(ds.PatientName, ds.Modality)
+ds.PatientName = "Anonymous"
+ds.save_as("anon.dcm")
+```
+
+This is great for **reading, tag-level editing, and anonymization**. But if you want to *create* a Segmentation object from scratch? You'd need to manually populate ~50+ required tags across multiple sequences, and any mistake produces a non-conformant file that PACS may reject.
+
+## What highdicom Adds
+
+highdicom provides Python classes that mirror DICOM IODs. You pass in your source images, pixel data, and metadata as Python objects, and it constructs a valid DICOM file for you.
+
+Key domains it covers:
+
+- **Segmentation (SEG)** — binary or fractional masks referencing source images
+- **Structured Reports (SR)** — TID 1500 measurement reports, findings
+- **Parametric Maps** — quantitative maps (ADC, perfusion, AI probability maps)
+- **Secondary Capture** — derived images
+- **Annotations** — Bulk Microscopy Simple Annotations, presentation states
+- **Key Object Selection** — marking significant images
+- **Softcopy Presentation States (GSPS)** — window/level, annotations overlays
+- **Legacy Converted Enhanced images** — classic → enhanced multiframe
+
+It also provides helpers for coded concepts (SNOMED, DCM, LOINC, RadLex) via `highdicom.sr.CodedConcept`, which is essential for SR and SEG.
+
+## Concrete Example: Creating a Segmentation
+
+Here's the difference in practice. Suppose your AI model outputs a binary lung mask, and you want to save it as a DICOM SEG referencing the original CT.
+
+**With pure pydicom** — you'd write 200+ lines populating `SegmentSequence`, `SharedFunctionalGroupsSequence`, `PerFrameFunctionalGroupsSequence`, `DimensionOrganizationSequence`, etc. Very error-prone.
+
+**With highdicom:**
+
+```python
+import highdicom as hd
+import numpy as np
+from pydicom import dcmread
+
+# Load source CT series (list of pydicom Datasets)
+source_images = [dcmread(f) for f in ct_files]
+
+# Your AI model's output: (num_slices, rows, cols) binary mask
+mask = ai_model.predict(...)  # np.uint8 array
+
+# Describe the segment using coded concepts
+lung_segment = hd.seg.SegmentDescription(
+    segment_number=1,
+    segment_label="Lung",
+    segmented_property_category=hd.sr.CodedConcept(
+        value="123037004", scheme_designator="SCT",
+        meaning="Anatomical Structure"
+    ),
+    segmented_property_type=hd.sr.CodedConcept(
+        value="39607008", scheme_designator="SCT", meaning="Lung"
+    ),
+    algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
+    algorithm_identification=hd.AlgorithmIdentificationSequence(
+        name="MyLungSegNet", version="1.0.0", family=hd.sr.CodedConcept(
+            value="113076", scheme_designator="DCM",
+            meaning="Segmentation"
+        ),
+    ),
+)
+
+seg = hd.seg.Segmentation(
+    source_images=source_images,
+    pixel_array=mask,
+    segmentation_type=hd.seg.SegmentationTypeValues.BINARY,
+    segment_descriptions=[lung_segment],
+    series_instance_uid=hd.UID(),
+    series_number=100,
+    sop_instance_uid=hd.UID(),
+    instance_number=1,
+    manufacturer="RamaAI",
+    manufacturer_model_name="LungSegNet",
+    software_versions="1.0.0",
+    device_serial_number="1",
+)
+
+seg.save_as("lung_seg.dcm")
+```
+
+highdicom automatically fills in the right frame-of-reference links, dimension organization, per-frame functional groups, and all the referenced-instance bookkeeping that keeps the SEG properly tied to the source CT.
+
+## Typical Use Cases
+
+```
+┌──────────────────────────┬─────────────────────────────────┐
+│ Task                     │ Best Tool                       │
+├──────────────────────────┼─────────────────────────────────┤
+│ Read a .dcm file         │ pydicom                         │
+│ Modify PatientName tag   │ pydicom                         │
+│ Anonymize a study        │ pydicom                         │
+│ Decode pixel data        │ pydicom (+ plugins)             │
+│ Batch tag inspection     │ pydicom                         │
+├──────────────────────────┼─────────────────────────────────┤
+│ Save AI mask as DICOM SEG│ highdicom                       │
+│ Create a quantitative    │ highdicom (Parametric Map)      │
+│   AI probability map     │                                 │
+│ Generate SR with         │ highdicom (sr module)           │
+│   measurements/findings  │                                 │
+│ Encode annotations       │ highdicom (ann module)          │
+│ Build GSPS (window/level │ highdicom (pr module)           │
+│   presets, overlays)     │                                 │
+│ Secondary Capture from   │ highdicom (sc module)           │
+│   matplotlib figure      │                                 │
+└──────────────────────────┴─────────────────────────────────┘
+```
+
+## Why This Matters for Your Radiology AI Unit
+
+Given your work, highdicom is particularly valuable when:
+
+1. **Deploying AI models to PACS** — PACS systems (and Orthanc) expect standards-conformant SEG/SR/PM objects. highdicom-produced files work cleanly with Orthanc, OHIF Viewer, 3D Slicer, and commercial PACS.
+
+2. **Integrating with viewers** — OHIF and Cornerstone3D render highdicom SEGs and SRs natively. You can push AI results to Orthanc and have them display as overlays automatically.
+
+3. **Research reproducibility** — SRs with coded concepts (SNOMED/RadLex) make downstream analysis and federated learning much cleaner than custom JSON sidecars.
+
+4. **Teaching** — highdicom's examples are great for showing trainees how AI outputs become FDA-pathway-compatible DICOM objects rather than loose PNG masks.
+
+## Practical Workflow
+
+```
+         Your AI Model (PyTorch/TF)
+                │
+                │ numpy array (mask, probabilities)
+                ▼
+         ┌──────────────┐
+         │  highdicom   │ ← uses pydicom internally
+         └──────┬───────┘
+                │ conformant DICOM SEG / SR / PM
+                ▼
+         ┌──────────────┐       ┌──────────────┐
+         │   Orthanc    │──────▶│ OHIF / Slicer│
+         │  (your Mac)  │ WADO  │   Viewer     │
+         └──────────────┘       └──────────────┘
+```
+
+You can push highdicom-generated objects to your local Orthanc via DICOM C-STORE (using `pynetdicom`) or the REST API, and they'll show up linked to the original study.
+
+## Installation Note
+
+```bash
+pip install highdicom
+```
+
+This pulls in pydicom as a dependency. You don't need to install pydicom separately — but you'll still `import pydicom` directly when you need low-level access (which happens often, even alongside highdicom).
+
+---
+
+**TL;DR:** Use **pydicom** for reading, editing, and anonymizing existing DICOM files. Use **highdicom** for *creating* new standards-conformant DICOM objects — especially AI outputs like segmentations, parametric maps, and structured reports. They're complementary, not competitors, and in real radiology AI pipelines you'll use both.
