@@ -1,0 +1,604 @@
+---
+title: "The Three-Layer Stack: Bundle, App SDK, MAP"
+---
+
+
+The single clearest way to understand these three is that they sit at **different layers of abstraction** and solve **different problems for different people on different days**. Let me walk through what each one is, who owns it, and how they compose.
+
+---
+
+## Conceptual Roles at a Glance
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                                                                    │
+│   MONAI Bundle            →  "The brain"                           │
+│   ─────────────────          Pure ML artifact.                     │
+│   Who produces it:           Data scientist / ML engineer          │
+│   What it contains:          Weights + metadata + declarative      │
+│                              preprocessing transforms              │
+│   Format:                    A *directory* with JSON configs       │
+│   Talks in:                  Tensors, NIfTI, in-memory arrays      │
+│   Knows nothing about:       DICOM, PACS, hospital systems         │
+│                                                                    │
+│   ── wrapped by ──                                                 │
+│                                                                    │
+│   MONAI Deploy App SDK    →  "The toolkit"                         │
+│   ─────────────────────      Python framework (build-time)         │
+│   Who uses it:               Deployment engineer                   │
+│   What it gives you:         Operator base class, DICOM Operators, │
+│                              Application runtime, DAG executor,    │
+│                              packaging CLI (`monai-deploy package`)│
+│   You write:                 An Application that composes          │
+│                              Operators into a pipeline             │
+│   Talks in:                  DICOM in, DICOM out                   │
+│                                                                    │
+│   ── produces ──                                                   │
+│                                                                    │
+│   MAP                     →  "The shippable product"               │
+│   ─────                      OCI container (runtime artifact)      │
+│   Who consumes it:           Orchestrator (mercure, Workflow       │
+│                              Manager, K8s), SREs, hospital IT      │
+│   What it contains:          App SDK runtime + your Application +  │
+│                              the Bundle + OS + CUDA + deps         │
+│   Format:                    `docker pull ghcr.io/you/app:v1.0`    │
+│   Immutable, signable, shippable                                   │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Another way to say it: **Bundle is WHAT (the model), App SDK is HOW (the build tool), MAP is WHERE (the deployable unit)**.
+
+---
+
+## The Dependency Direction
+
+The arrows matter — each layer depends on the one above, not the other way around:
+
+```
+                 ┌──────────────────┐
+                 │   MONAI Bundle   │   ← stands alone, reusable
+                 │  (self-contained)│     (you can use it in
+                 └────────▲─────────┘      a Jupyter notebook
+                          │                or training loop)
+                          │ embeds
+                          │
+                 ┌────────┴─────────┐
+                 │ Application      │   ← written using App SDK;
+                 │  (Operator DAG)  │     calls the Bundle through
+                 │                  │     MonaiBundleInferenceOperator
+                 └────────▲─────────┘
+                          │
+                          │ packaged as
+                          │
+                 ┌────────┴─────────┐
+                 │      MAP         │   ← produced by
+                 │ (OCI container)  │     `monai-deploy package …`
+                 └──────────────────┘
+```
+
+A Bundle is useful on its own — people run them inside Jupyter, inside training pipelines, or inside MLflow. A Bundle *without* a MAP is still a complete ML artifact. But an Application *without* a Bundle is just plumbing, and a MAP *without* an Application is impossible (MAP is literally the packaged form of an Application).
+
+---
+
+## Layer 1 — The MONAI Bundle
+
+### What it is
+
+A **directory on disk** with a fixed layout. That's the whole trick — it's a convention, not a binary format. Any tool that understands the convention can consume it.
+
+```
+bundle_lung_seg/
+├── configs/
+│   ├── metadata.json        ← who, what, version, I/O shapes, license
+│   ├── inference.json       ← declarative pre/post/inference pipeline
+│   ├── train.json           ← optional — training config
+│   └── logging.conf
+├── models/
+│   ├── model.pt             ← PyTorch weights
+│   └── model.onnx           ← optional — portable ONNX export
+├── docs/
+│   ├── README.md
+│   └── license.txt
+└── scripts/                 ← optional custom Python code
+```
+
+The two files that make this a *Designed Published Language* (in the DDD sense) are `metadata.json` and `inference.json`. They are what make a Bundle **interpretable without reading Python source**.
+
+### `configs/metadata.json` — the model's identity card
+
+```json
+{
+  "version": "1.0.3",
+  "changelog": {
+    "1.0.3": "Retrained with 500 additional Rama chest CT cases.",
+    "1.0.2": "Fixed RAS orientation bug."
+  },
+  "monai_version": "1.4.0",
+  "pytorch_version": "2.3.1",
+  "task": "Lung segmentation from chest CT",
+  "description": "3D UNet for left/right lung segmentation on non-contrast chest CT.",
+  "authors": "Radiology AI Unit, Ramathibodi Hospital",
+  "copyright": "© 2026 Ramathibodi Hospital",
+  "data_source": "Internal, IRB-approved (Rama-IRB-2025-XXX)",
+  "data_type": "dicom",
+  "image_classes": "3D CT, non-contrast",
+  "network_data_format": {
+    "inputs": {
+      "image": {
+        "type": "image",
+        "format": "hounsfield",
+        "modality": "CT",
+        "num_channels": 1,
+        "spatial_shape": [96, 96, 96],
+        "dtype": "float32",
+        "value_range": [-1000, 1000],
+        "is_patch_data": true
+      }
+    },
+    "outputs": {
+      "pred": {
+        "type": "image",
+        "format": "segmentation",
+        "num_channels": 3,
+        "spatial_shape": [96, 96, 96],
+        "dtype": "float32",
+        "channel_def": {"0": "background", "1": "left_lung", "2": "right_lung"}
+      }
+    }
+  }
+}
+```
+
+Notice `network_data_format` — this is the *machine-readable contract* that separates MONAI Bundle from ONNX. ONNX tells you "input is `float32[1,1,96,96,96]`". Bundle tells you "input is `hounsfield CT` at `[-1000, 1000]` HU, one channel, sliding-window patches of 96³." That is the **preprocessing contract**.
+
+### `configs/inference.json` — the executable preprocessing + inference DAG
+
+This is the file that makes Bundle uniquely valuable for radiology. It declaratively describes the transforms using MONAI's ConfigParser:
+
+```json
+{
+  "imports": [
+    "$import glob",
+    "$import os"
+  ],
+  "bundle_root": ".",
+  "ckpt_path": "$@bundle_root + '/models/model.pt'",
+  "dataset_dir": "/workspace/input",
+
+  "device": "$torch.device('cuda:0')",
+  "network_def": {
+    "_target_": "monai.networks.nets.UNet",
+    "spatial_dims": 3,
+    "in_channels": 1,
+    "out_channels": 3,
+    "channels": [16, 32, 64, 128, 256],
+    "strides": [2, 2, 2, 2]
+  },
+  "network": "$@network_def.to(@device)",
+
+  "preprocessing": {
+    "_target_": "Compose",
+    "transforms": [
+      {"_target_": "LoadImaged",       "keys": "image"},
+      {"_target_": "EnsureChannelFirstd","keys": "image"},
+      {"_target_": "Orientationd",     "keys": "image", "axcodes": "RAS"},
+      {"_target_": "Spacingd",         "keys": "image", "pixdim": [1.5, 1.5, 2.0]},
+      {"_target_": "ScaleIntensityRanged",
+         "keys": "image", "a_min": -1000, "a_max": 400,
+         "b_min": 0.0, "b_max": 1.0, "clip": true},
+      {"_target_": "CropForegroundd",  "keys": "image", "source_key": "image"},
+      {"_target_": "EnsureTyped",      "keys": "image"}
+    ]
+  },
+
+  "inferer": {
+    "_target_": "SlidingWindowInferer",
+    "roi_size": [96, 96, 96],
+    "sw_batch_size": 4,
+    "overlap": 0.5
+  },
+
+  "postprocessing": {
+    "_target_": "Compose",
+    "transforms": [
+      {"_target_": "Activationsd", "keys": "pred", "softmax": true},
+      {"_target_": "AsDiscreted",  "keys": "pred", "argmax": true},
+      {"_target_": "Invertd",      "keys": "pred",
+         "transform": "@preprocessing", "orig_keys": "image"},
+      {"_target_": "SaveImaged",   "keys": "pred",
+         "output_dir": "@output_dir", "output_postfix": "seg"}
+    ]
+  }
+}
+```
+
+Read that carefully — every field labelled `"_target_"` is a Python class name. The ConfigParser instantiates them at runtime. Result: **the preprocessing pipeline is data, not code**. You could swap `pixdim` to `[1.0, 1.0, 1.0]` by editing JSON, with no recompile. You could lint it, diff it in Git, attach it to an FDA submission as the "description of preprocessing."
+
+### Using a Bundle alone (no MAP, no App SDK)
+
+```python
+from monai.bundle import ConfigParser
+
+parser = ConfigParser()
+parser.read_config("bundle_lung_seg/configs/inference.json")
+parser.read_meta("bundle_lung_seg/configs/metadata.json")
+
+# Instantiate everything declared in JSON
+preprocessing  = parser.get_parsed_content("preprocessing")
+network        = parser.get_parsed_content("network")
+inferer        = parser.get_parsed_content("inferer")
+postprocessing = parser.get_parsed_content("postprocessing")
+
+# Load checkpoint
+network.load_state_dict(torch.load(parser.get_parsed_content("ckpt_path")))
+network.eval()
+
+# Run on a NIfTI file
+data = preprocessing({"image": "/path/to/ct.nii.gz"})
+with torch.no_grad():
+    data["pred"] = inferer(data["image"].unsqueeze(0).to("cuda"), network)
+postprocessing(data)  # writes output NIfTI
+```
+
+At this level you are **outside the hospital context**. No DICOM, no PACS. This is what a data scientist works with at a desk.
+
+---
+
+## Layer 2 — The MONAI Deploy App SDK
+
+### What it is
+
+A **Python framework** (`pip install monai-deploy-app-sdk`) that gives you three things:
+
+1. A **runtime** — the class `Application` with a `compose()` method and an execution engine that walks a DAG.
+2. A library of **pre-built Operators** — especially DICOM-aware ones that a plain Bundle cannot provide.
+3. A **packaging CLI** — `monai-deploy package` that turns your Application into a MAP.
+
+The Operator is the core abstraction. Each Operator is a Python class with typed inputs and outputs:
+
+```
+          ┌─────────────────────────┐
+          │       Operator          │
+          │  (user-defined or       │
+          │   built-in)             │
+          │                         │
+   in ───▶│  compute() method       │────▶ out
+          │                         │
+          │  • declares in/out types│
+          │  • runs as one DAG node │
+          └─────────────────────────┘
+```
+
+### The built-in Operator catalogue (the valuable part)
+
+These are what a Bundle alone cannot give you:
+
+```
+Category          Built-in Operator
+────────────────  ─────────────────────────────────────────────
+DICOM ingress     DICOMDataLoaderOperator
+                  DICOMSeriesSelectorOperator
+                  DICOMSeriesToVolumeOperator
+
+Inference core    MonaiBundleInferenceOperator   ← glue layer!
+                  InferenceOperator               (low-level)
+
+DICOM egress      DICOMSegmentationWriterOperator (SEG / Sup 111)
+                  DICOMTextSRWriterOperator       (SR TID 1500)
+                  PublisherOperator               (push to PACS)
+
+Utilities         PublisherOperator, ClaraVizOperator
+```
+
+The `MonaiBundleInferenceOperator` is the **bridge** between Layer 1 and Layer 2. It takes a Bundle path and exposes it as an Operator:
+
+```python
+# Inside the App SDK, conceptually:
+class MonaiBundleInferenceOperator(Operator):
+    def __init__(self, bundle_path):
+        self.parser = ConfigParser()
+        self.parser.read_config(f"{bundle_path}/configs/inference.json")
+        self.preprocessing  = self.parser.get_parsed_content("preprocessing")
+        self.network        = self.parser.get_parsed_content("network")
+        self.inferer        = self.parser.get_parsed_content("inferer")
+        self.postprocessing = self.parser.get_parsed_content("postprocessing")
+
+    def compute(self, op_input, op_output, context):
+        volume = op_input.get("image")       # from DICOMSeriesToVolume
+        data   = self.preprocessing({"image": volume})
+        data["pred"] = self.inferer(data["image"], self.network)
+        data   = self.postprocessing(data)
+        op_output.set(data["pred"], label="seg")
+```
+
+### Writing an Application — the full example
+
+Here's a complete Rama lung-segmentation app. This file is what you commit to the `ramaai-dev/rama-lung-seg-map` repo:
+
+```python
+# app.py
+import logging
+from pathlib import Path
+
+from monai.deploy.core import Application, env, resource
+from monai.deploy.operators.dicom_data_loader_operator \
+    import DICOMDataLoaderOperator
+from monai.deploy.operators.dicom_series_selector_operator \
+    import DICOMSeriesSelectorOperator
+from monai.deploy.operators.dicom_series_to_volume_operator \
+    import DICOMSeriesToVolumeOperator
+from monai.deploy.operators.monai_bundle_inference_operator \
+    import MonaiBundleInferenceOperator, IOMapping
+from monai.deploy.operators.dicom_seg_writer_operator \
+    import DICOMSegmentationWriterOperator, SegmentDescription
+
+
+@resource(cpu=2, gpu=1, memory="8Gi")
+@env(pip_packages=["highdicom>=0.22", "pydicom>=2.4"])
+class RamaLungSegApp(Application):
+    """Rama Lung Segmentation — reads CT series, emits DICOM SEG to PACS."""
+
+    name        = "rama-lung-seg"
+    description = "Left/right lung segmentation on non-contrast chest CT"
+    version     = "1.0.3"
+
+    def compose(self):
+        logging.info("Composing Rama Lung Seg Application")
+
+        # ── DICOM selection rule: pick axial non-contrast chest CT ──────
+        selection_rules = """{
+          "selections": [{
+            "name": "CT Chest Non-contrast",
+            "conditions": {
+              "Modality":          "(?i)CT",
+              "BodyPartExamined":  "(?i)chest|thorax",
+              "ContrastBolusAgent":"^$"
+            }
+          }]
+        }"""
+
+        loader   = DICOMDataLoaderOperator(self, name="loader")
+        selector = DICOMSeriesSelectorOperator(
+            self, rules=selection_rules, name="selector"
+        )
+        to_vol   = DICOMSeriesToVolumeOperator(self, name="to_vol")
+
+        # ── The Bundle becomes an Operator here ─────────────────────────
+        bundle_op = MonaiBundleInferenceOperator(
+            self,
+            app_context=self.context,
+            bundle_path=Path(__file__).parent / "bundle_lung_seg",
+            input_mapping=[IOMapping("image", "nifti", ("numpy.ndarray",))],
+            output_mapping=[IOMapping("pred",  "image", ("numpy.ndarray",))],
+            name="bundle_inference",
+        )
+
+        # ── DICOM SEG egress (Supplement 111 via highdicom) ─────────────
+        seg_writer = DICOMSegmentationWriterOperator(
+            self,
+            segment_descriptions=[
+                SegmentDescription(
+                    segment_label="Left Lung",
+                    segmented_property_category=("T-D0050", "SRT", "Anatomical Structure"),
+                    segmented_property_type=("T-28000", "SRT", "Left Lung"),
+                ),
+                SegmentDescription(
+                    segment_label="Right Lung",
+                    segmented_property_category=("T-D0050", "SRT", "Anatomical Structure"),
+                    segmented_property_type=("T-29000", "SRT", "Right Lung"),
+                ),
+            ],
+            name="seg_writer",
+        )
+
+        # ── Wire the DAG ────────────────────────────────────────────────
+        self.add_flow(loader,    selector,    {"dicom_study_list": "dicom_study_list"})
+        self.add_flow(selector,  to_vol,      {"study_selected_series_list": "study_selected_series_list"})
+        self.add_flow(to_vol,    bundle_op,   {"image": "image"})
+        self.add_flow(bundle_op, seg_writer,  {"pred": "seg_image"})
+        self.add_flow(selector,  seg_writer,  {"study_selected_series_list": "study_selected_series_list"})
+
+
+if __name__ == "__main__":
+    RamaLungSegApp(do_run=True)
+```
+
+The DAG you built:
+
+```
+  loader ──▶ selector ──▶ to_vol ──▶ bundle_op ──▶ seg_writer
+                 │                                     ▲
+                 └─────────────────────────────────────┘
+                   (series metadata threads through
+                    so SEG inherits Study/Frame-of-Reference)
+```
+
+Two things worth noticing. First, the `MonaiBundleInferenceOperator(..., bundle_path=...)` is the *exact seam* between Layer 1 and Layer 2 — everything to the left of it is DICOM-land (App SDK's job), everything inside it is tensor-land (Bundle's job). Second, the two decorators `@resource` and `@env` are hints consumed by the packaging CLI when building the OCI image.
+
+---
+
+## Layer 3 — The MAP (the packaged output)
+
+### What the build command does
+
+```bash
+monai-deploy package app.py \
+    --tag ghcr.io/ramaai-dev/rama-lung-seg:1.0.3 \
+    --platform x86_64-cuda \
+    --log-level INFO \
+    -c app.yaml
+```
+
+This single command produces an OCI image. Under the hood it:
+
+1. Reads `@resource` and `@env` decorators to size the container.
+2. Copies `app.py` + `bundle_lung_seg/` into `/opt/holoscan/app/`.
+3. Bakes a `/etc/monai/app.json` manifest describing name, version, inputs (DICOM series), outputs (DICOM SEG), resources, timeout.
+4. Writes an `ENTRYPOINT` that invokes the App SDK runtime with `app.py`.
+5. Wraps it all in a CUDA-enabled base image.
+
+The resulting image structure (simplified):
+
+```
+ghcr.io/ramaai-dev/rama-lung-seg:1.0.3
+│
+├── /opt/nvidia/monai/                  ← App SDK runtime
+├── /opt/holoscan/app/
+│     ├── app.py                        ← your Application
+│     ├── bundle_lung_seg/              ← your Bundle (complete)
+│     │     ├── configs/…
+│     │     └── models/…
+│     └── requirements.txt
+├── /etc/monai/
+│     └── app.json                      ← MAP manifest (contract)
+├── /var/monai/input/                   ← mount point for DICOM in
+├── /var/monai/output/                  ← mount point for DICOM out
+└── ENTRYPOINT ["python", "-m", "monai.deploy.runner", "/opt/holoscan/app/app.py"]
+```
+
+### Running the MAP
+
+Because it's OCI, any container runtime can execute it. The contract is **DICOM in a directory → DICOM out a directory**:
+
+```bash
+docker run --gpus all --rm \
+  -v /tmp/input:/var/monai/input:ro \
+  -v /tmp/output:/var/monai/output \
+  ghcr.io/ramaai-dev/rama-lung-seg:1.0.3
+```
+
+mercure dispatches to this identical command when a rule matches. The Workflow Manager dispatches to it. A Kubernetes Job dispatches to it. Same interface, many callers — this is why MAP works as a Published Language for the deployment context.
+
+### The `app.json` manifest
+
+```json
+{
+  "apiVersion": "1.0",
+  "command": ["python", "-m", "monai.deploy.runner", "/opt/holoscan/app/app.py"],
+  "environment": {
+    "HOLOSCAN_INPUT_PATH":  "/var/monai/input",
+    "HOLOSCAN_OUTPUT_PATH": "/var/monai/output",
+    "HOLOSCAN_MODEL_PATH":  "/opt/holoscan/models"
+  },
+  "input": {
+    "path":    "input/",
+    "formats": ["dicom"]
+  },
+  "output": {
+    "path":    "output/",
+    "formats": ["dicom-seg"]
+  },
+  "resources": {
+    "cpu": 2,
+    "gpu": 1,
+    "memory": "8Gi",
+    "gpu_memory": "8Gi"
+  },
+  "timeout": 300,
+  "version": "1.0.3",
+  "working_directory": "/var/monai/working"
+}
+```
+
+This manifest is what mercure and the Workflow Manager read to decide *how* to schedule the MAP — how much GPU memory to reserve, how long before timing out, where to mount inputs.
+
+---
+
+## The Full Lifecycle — Build Time vs Run Time
+
+Here's the picture that ties it all together, with the two distinct phases clearly separated:
+
+```
+  ═══════════════════ BUILD TIME (data scientist + deployment engineer) ═══════════════════
+
+  ┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
+  │ 1. Train model   │       │ 2. Export as     │       │ 3. Write App     │
+  │ PyTorch training │──────▶│    Bundle        │──────▶│    using SDK     │
+  │ on Rama CT data  │       │ (JSON configs +  │       │ (DICOM Operators │
+  │                  │       │  weights)        │       │  + Bundle Op)    │
+  └──────────────────┘       └──────────────────┘       └────────┬─────────┘
+                                      │                           │
+                                      │                           ▼
+                                      │             ┌──────────────────────┐
+                                      │             │ 4. monai-deploy      │
+                                      └────────────▶│    package app.py    │
+                                                    │    → OCI image       │
+                                                    └────────┬─────────────┘
+                                                             │
+                                                             ▼
+                                                    ┌──────────────────────┐
+                                                    │ 5. cosign sign +     │
+                                                    │    push to registry  │
+                                                    │    (ghcr.io/...)     │
+                                                    └──────────────────────┘
+
+  ═══════════════════ RUN TIME (orchestrator + hospital) ═══════════════════════════════════
+
+   PACS                     Orchestrator              MAP Container                  PACS
+   ────                     ────────────              ─────────────                  ────
+     │                           │                          │                          │
+     │  New CT study             │                          │                          │
+     ├──────────────────────────▶│                          │                          │
+     │  (DIMSE C-STORE)          │                          │                          │
+     │                           │ rule: Modality=CT,       │                          │
+     │                           │       BodyPart=CHEST     │                          │
+     │                           │   → route to rama-lung-seg                          │
+     │                           │                          │                          │
+     │                           │ docker run               │                          │
+     │                           ├─────────────────────────▶│                          │
+     │                           │ (mount input DICOM)      │                          │
+     │                           │                          │                          │
+     │                           │              ┌───────────▼──────────┐               │
+     │                           │              │ App SDK runtime      │               │
+     │                           │              │ executes Operator DAG│               │
+     │                           │              │   loader → selector  │               │
+     │                           │              │   → to_vol →         │               │
+     │                           │              │   [Bundle: transforms│               │
+     │                           │              │    → UNet → post]    │               │
+     │                           │              │   → seg_writer       │               │
+     │                           │              └───────────┬──────────┘               │
+     │                           │                          │                          │
+     │                           │  DICOM SEG in /output/   │                          │
+     │                           │◀─────────────────────────┤                          │
+     │                           │                          │                          │
+     │                           │   STOW-RS                │                          │
+     │  DICOM SEG back to PACS   │                          │                          │
+     │◀──────────────────────────┤                          │                          │
+     │                           │                          │                          │
+```
+
+---
+
+## Why the Separation Matters (DDD framing)
+
+Because you care about software architecture philosophy, here's the framing that justifies the three layers:
+
+**Bundle = Domain Model.** Pure, framework-agnostic-ish, talks in the language of medical imaging (HU, spacing, modality, segmentation classes). It has no infrastructure dependencies — no DICOM, no filesystem layouts, no container runtime. A radiologist-scientist can reason about it without caring how it gets deployed.
+
+**App SDK = Application Layer.** It is the orchestration of use cases, in Evans's sense. It composes domain objects (Bundles) with infrastructure adapters (DICOM operators) into a coherent workflow. It does *not* contain domain logic — `MonaiBundleInferenceOperator` is a thin wrapper, not a reimplementation. The DICOM Operators are *adapters* at the bounded-context boundary.
+
+**MAP = Published Language / Infrastructure Artifact.** It is the contract the deployment context publishes to the orchestration context. Orchestrators do not read Python source — they read the `app.json` manifest and invoke `docker run`. The OCI digest is the configuration item that IEC 62304 and FDA PCCP want to pin.
+
+The payoff: you can **swap any one layer without touching the others**.
+
+```
+  Keep Bundle, change App          Keep App, swap Bundle          Keep MAP, replace runtime
+  ───────────────────────          ─────────────────────          ─────────────────────────
+  Same model, but new              Same DICOM pipeline,           MAP is OCI — runs on Docker,
+  input: now served over           but model upgraded from        Podman, containerd, K8s,
+  a REST API instead of            v1.0 → v1.1 (retrained)        OpenShift. Zero code change
+  DICOM ingress.                                                  in the Application.
+```
+
+---
+
+## Practical Use Cases for Your Platform
+
+**Case A — Rama-developed model, in-house deployment.** Write Bundle → write Application → `monai-deploy package` → push to `ghcr.io/ramaai-dev/` → mercure routes studies to it. You own all three layers. This is your primary workflow.
+
+**Case B — Reuse a MONAI Model Zoo Bundle.** Pull `monai/spleen_ct_segmentation` Bundle from the Zoo. Write a thin Application that wraps it with your Rama-specific DICOM selection rules. Package as your own MAP. You own layer 2 & 3; you borrow layer 1.
+
+**Case C — Vendor ships a MAP.** Vendor hands you `vendor/stroke-ct:2.1`. You don't care what's inside. mercure or the Workflow Manager runs it. You own layer 3 execution only.
+
+**Case D — Research without deployment.** Data scientist writes a Bundle, runs it from a Jupyter notebook via `ConfigParser`, iterates on preprocessing. No MAP, no App SDK needed. Once ready, promote to Case A. This is the "Bundle alone is useful" path.

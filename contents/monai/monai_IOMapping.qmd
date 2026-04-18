@@ -1,0 +1,82 @@
+---
+title: "What `IOMapping` does"
+---
+
+
+`IOMapping` is a small descriptor that tells `MonaiBundleInferenceOperator` **how to wire its I/O ports to the bundle's internal input/output names**. It's the contract between two worlds: the Holoscan/App SDK pipeline (which thinks in terms of operators connected by named ports) and the MONAI Bundle (which declares its own expected tensor names inside `metadata.json`).
+
+### The canonical signature
+
+From the MONAI Deploy App SDK docs, an IOMapping defines an input or output's name, type, and storage type, so the constructor takes three positional arguments:
+
+```python
+IOMapping(label, data_type, storage_type)
+```
+
+| Arg | Purpose |
+|---|---|
+| `label` | Must match a key inside the bundle's `metadata.json` under `network_data_format.inputs` / `.outputs`. For most segmentation bundles that's `"image"` in and `"pred"` out. |
+| `data_type` | The Python class the App SDK should treat the payload as — canonically `monai.deploy.core.Image`. This controls how data is (de)serialized between operators. |
+| `storage_type` | An `IOType` enum. Normally `IOType.IN_MEMORY` (the tensor flows through RAM); `IOType.DISK` would round-trip via a file. |
+
+### Why it exists
+
+`input_mapping` and `output_mapping` define the names, types, and storage types of the bundle operator's inputs and outputs. A MONAI Bundle is a portable, self-contained model package; its `metadata.json` declares something like:
+
+```json
+"network_data_format": {
+  "inputs":  { "image": { ... } },
+  "outputs": { "pred":  { ... } }
+}
+```
+
+The pipeline itself doesn't know about those names — so `IOMapping` is how you tell the operator *"the tensor flowing into my `image` port should be routed to the bundle's `image` input, and the bundle's `pred` output should leave through my `pred` port."* The labels typically come from examining the bundle's `network_data_format` attribute.
+
+### The wiring, visually
+
+```
+Upstream operator          MonaiBundleInferenceOperator            Downstream operator
+(e.g. NIfTI loader)                                                (e.g. Seg writer)
+
+   ┌──────────┐         ┌────────────────────────────────┐         ┌──────────┐
+   │ produces │         │ input_mapping:                 │         │ consumes │
+   │  Image   │────────▶│   label="image" ──► bundle in  │         │   Image  │
+   └──────────┘         │                                │         └────▲─────┘
+                        │     [ MONAI Bundle executes ]  │              │
+                        │                                │              │
+                        │ output_mapping:                │              │
+                        │   label="pred"  ──► bundle out │──────────────┘
+                        └────────────────────────────────┘
+                                    ▲
+                        storage_type = IN_MEMORY vs DISK
+                        data_type    = what class flows on the wire
+```
+
+### A note on *your specific snippet*
+
+The arguments you pasted look non-standard:
+
+```python
+IOMapping("image", "nifti", ("numpy.ndarray",))     # string + tuple
+IOMapping("pred",  "image", ("numpy.ndarray",))
+```
+
+The canonical MONAI Deploy App SDK form would be:
+
+```python
+from monai.deploy.core import Image, IOType
+
+IOMapping("image", Image, IOType.IN_MEMORY)
+IOMapping("pred",  Image, IOType.IN_MEMORY)
+```
+
+A few things to verify in your project:
+
+1. **Check the import.** Run in a REPL:
+   ```python
+   from monai.deploy.core import IOMapping
+   import inspect; print(inspect.signature(IOMapping.__init__))
+   ```
+   If the signature still shows `(label, data_type, storage_type)`, then the snippet you were given is either pseudocode or won't actually run.
+2. **Check for a local wrapper.** Some in-house codebases wrap `IOMapping` to accept strings (e.g. `"nifti"` → a resolver that maps to `Image` + some reader). A quick `git grep "class IOMapping\|def IOMapping"` will find it.
+3. **Check the bundle.** Open `bundle_lung_seg/configs/metadata.json` and confirm `network_data_format.inputs` really has a key called `image` and outputs has `pred` — if not, the `label` strings need to change.

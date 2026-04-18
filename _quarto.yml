@@ -17,7 +17,7 @@ book:
       chapters: 
         - text: ".pt, .ts, .onnx"
           href: "contents/model/whatis_pt_ts_onnx.qmd"
-    - part: Packages & Containers
+    - part: MONAI Overview
       chapters:
         - text: "OCI-Compatible Container"
           href: "contents/containers/oci-compatible-containers.qmd"
@@ -25,6 +25,12 @@ book:
           href: "contents/monai/monai_map.qmd"
         - text: "MAP Example"
           href: "contents/monai/nonai_map_example.qmd"
+        - text: "MONAI Bundle, App SDK, MAP"
+          href: "contents/monai/monai_map-appsdk-bundle.qmd"
+    - part: MONAI Details
+      chapters: 
+        - text: "IOMapping in MonaiBundleInferenceOperator"
+          href: "contents/monai/monai_IOMapping.qmd"
     - part: Landscape & Protocols
       chapters: 
         - text: "OSS Landscape for AI Orchestraction"
