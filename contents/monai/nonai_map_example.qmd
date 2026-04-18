@@ -1,0 +1,419 @@
+---
+title: "A Concrete MAP Example"
+---
+
+## MAP Example
+
+Let me walk through a minimal but realistic MAP — a DICOM CT → spleen segmentation app. I'll show two views: **what you write as a developer** (dev-time) and **what ends up inside the MAP container** (run-time).
+
+### 1. Dev-Time: Your Project Folder
+
+This is what lives in your Git repo. You write **Python + a YAML config**. That's it.
+
+```
+my_spleen_seg_app/
+├── app.py                 ← Application (the DAG)
+├── __main__.py            ← so `python my_spleen_seg_app/` works
+├── spleen_seg_operator.py ← your custom operator
+├── app.yaml               ← MAP resource/runtime spec
+└── requirements.txt       ← Python deps
+```
+
+### 2. `app.py` — The Application (Pipeline as a DAG)
+
+The `Application.compose()` method wires operators together into a directed acyclic graph. Each operator is one stage.
+
+```python
+# app.py
+import logging
+from pathlib import Path
+
+from monai.deploy.core import AppContext, Application
+from monai.deploy.operators.dicom_data_loader_operator import DICOMDataLoaderOperator
+from monai.deploy.operators.dicom_series_selector_operator import DICOMSeriesSelectorOperator
+from monai.deploy.operators.dicom_series_to_volume_operator import DICOMSeriesToVolumeOperator
+from monai.deploy.operators.dicom_seg_writer_operator import (
+    DICOMSegmentationWriterOperator, SegmentDescription,
+)
+from pydicom.sr.codedict import codes
+
+from spleen_seg_operator import SpleenSegOperator
+
+
+class SpleenSegApp(Application):
+    name = "spleen-seg-app"
+    description = "Spleen segmentation on DICOM CT series."
+    version = "1.0.0"
+
+    def compose(self):
+        app_context = AppContext({})
+        app_input_path = Path(app_context.input_path)
+        app_output_path = Path(app_context.output_path)
+        model_path = Path(app_context.model_path)
+
+        # --- operators ---------------------------------------------
+        loader   = DICOMDataLoaderOperator(self, input_folder=app_input_path, name="loader")
+        selector = DICOMSeriesSelectorOperator(self, rules='{"selections":[{"name":"CT","conditions":{"Modality":"(?i)CT"}}]}', name="selector")
+        to_vol   = DICOMSeriesToVolumeOperator(self, name="to_vol")
+        seg      = SpleenSegOperator(self, model_path=model_path, name="seg")
+        writer   = DICOMSegmentationWriterOperator(
+            self,
+            segment_descriptions=[SegmentDescription(
+                segment_label="Spleen",
+                segmented_property_category=codes.SCT.Organ,
+                segmented_property_type=codes.SCT.Spleen,
+            )],
+            output_folder=app_output_path,
+            name="writer",
+        )
+
+        # --- wire the DAG ------------------------------------------
+        self.add_flow(loader,   selector, {("dicom_study_list", "dicom_study_list")})
+        self.add_flow(selector, to_vol,   {("study_selected_series_list", "study_selected_series_list")})
+        self.add_flow(to_vol,   seg,      {("image", "image")})
+        self.add_flow(seg,      writer,   {("seg_image", "seg_image")})
+        self.add_flow(selector, writer,   {("study_selected_series_list", "study_selected_series_list")})
+
+
+if __name__ == "__main__":
+    SpleenSegApp().run()
+```
+
+The pipeline visually:
+
+```
+  DICOM files          Select        DICOM→         Spleen          DICOM-SEG
+  on disk     ───►   CT series   ──► Volume   ──►  Inference   ──►   writer
+                                                  (PyTorch)           ↓
+                                                                    output/
+                                                                    SEG.dcm
+```
+
+### 3. `__main__.py` — Entry Point Shim
+
+Makes the folder itself runnable as `python my_spleen_seg_app/`. The Packager looks for this.
+
+```python
+# __main__.py
+from app import SpleenSegApp
+
+if __name__ == "__main__":
+    SpleenSegApp().run()
+```
+
+### 4. A Custom Operator (your AI logic)
+
+Operators are the reusable units. They declare inputs/outputs and implement `compute()`.
+
+```python
+# spleen_seg_operator.py
+from pathlib import Path
+from monai.deploy.core import Fragment, Operator, OperatorSpec
+
+class SpleenSegOperator(Operator):
+    """Runs a PyTorch spleen segmentation model."""
+
+    def __init__(self, fragment: Fragment, *args, model_path: Path, **kwargs):
+        self.model_path = model_path
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("image")       # a volumetric Image (from DICOM→Volume op)
+        spec.output("seg_image")  # a segmentation Image
+
+    def compute(self, op_input, op_output, context):
+        image = op_input.receive("image")
+        # ... load model from self.model_path, run inference ...
+        seg_image = self._run_model(image)
+        op_output.emit(seg_image, "seg_image")
+
+    def _run_model(self, image):
+        # PyTorch / MONAI inference here
+        ...
+```
+
+### 5. `app.yaml` — The MAP Specification
+
+This is the file that turns a plain Python app into a *MAP*. It's where resource requirements and I/O contracts get declared. A YAML file is required to store such information with sections and attributes as defined in the MONAI Application Package Specification. This file is only needed when the application is packaged into a MONAI Application Package container image.
+
+```yaml
+# app.yaml
+%YAML 1.2
+---
+application:
+  title: Spleen Segmentation MAP
+  version: 1.0.0
+  inputFormats: ["file"]
+  outputFormats: ["file"]
+
+resources:
+  cpu: 1
+  gpu: 1
+  memory: 2Gi
+  gpuMemory: 6Gi
+
+timeout: 0
+working-directory: /var/monai
+```
+
+This is the **declaration** that hosting platforms read before launching the container — it tells Kubernetes, for instance, to schedule your pod on a node with ≥ 6 GiB of GPU memory.
+
+### 6. `requirements.txt`
+
+```
+monai>=1.3
+monai-deploy-app-sdk>=1.0
+torch>=2.0
+pydicom>=2.3
+highdicom>=0.18
+nibabel>=5.0
+numpy>=1.23
+SimpleITK>=2.2
+```
+
+### 7. Build the MAP — One Command
+
+```bash
+monai-deploy package my_spleen_seg_app \
+    -m ./models/spleen_ct \
+    -c my_spleen_seg_app/app.yaml \
+    -t ramaai/spleen-seg:1.0.0 \
+    --platform x86_64
+```
+
+Behind the scenes this generates a `Dockerfile`, pulls the NVIDIA PyTorch base image, copies your code + model, generates the MAP manifests, and `docker build`s an OCI image.
+
+### 8. Run-Time: What's Inside the Resulting MAP
+
+After packaging, here's what's actually in the container image — notice your files have been placed into the **MAP standard layout**:
+
+```
+/                           ← container root
+├── etc/
+│   └── monai/
+│       ├── app.json        ← AUTO-GENERATED Application Manifest
+│       └── pkg.json        ← AUTO-GENERATED Package Manifest
+├── opt/
+│   └── monai/
+│       ├── app/            ← your Python code lands here
+│       │   ├── app.py
+│       │   ├── __main__.py
+│       │   └── spleen_seg_operator.py
+│       └── models/
+│           └── spleen_ct/  ← your model weights
+│               └── model.ts
+└── var/
+    └── monai/
+        ├── input/          ← empty; DICOM mounted here at runtime
+        └── output/         ← empty; results written here at runtime
+```
+
+#### The auto-generated `app.json` (Application Manifest)
+
+```json
+{
+  "apiVersion": "1.0.0",
+  "command": "[\"python3\", \"/opt/monai/app/\"]",
+  "environment": {
+    "HOLOSCAN_INPUT_PATH":  "input/",
+    "HOLOSCAN_OUTPUT_PATH": "output/",
+    "HOLOSCAN_MODEL_PATH":  "/opt/monai/models"
+  },
+  "input": {
+    "path":    "input/",
+    "formats": ["file"]
+  },
+  "output": {
+    "path":    "output/",
+    "formats": ["file"]
+  },
+  "timeout": 0,
+  "workingDirectory": "/var/monai",
+  "version": "1.0.0"
+}
+```
+
+#### The auto-generated `pkg.json` (Package Manifest)
+
+```json
+{
+  "apiVersion": "1.0.0",
+  "applicationRoot": "/opt/monai/app",
+  "modelRoot":       "/opt/monai/models",
+  "models": [
+    { "name": "spleen_ct", "path": "/opt/monai/models/spleen_ct" }
+  ],
+  "resources": {
+    "cpu": 1,
+    "gpu": 1,
+    "memory":    "2Gi",
+    "gpuMemory": "6Gi"
+  },
+  "version": "1.0.0"
+}
+```
+
+These manifests are the "contract" — any MAP-aware orchestrator (mercure, MONAI Workflow Manager, AWS HealthImaging) can read them *without running the container* and decide where/how to schedule it.
+
+### 9. Running the MAP
+
+Because it's OCI-compliant, you use the normal container CLI:
+
+```bash
+docker run --rm --gpus all \
+  -v $(pwd)/dicom_input:/var/monai/input \
+  -v $(pwd)/results:/var/monai/output \
+  ramaai/spleen-seg:1.0.0
+```
+
+Or using the MONAI App Runner (which reads the manifests and figures out mounts automatically):
+
+```bash
+monai-deploy run ramaai/spleen-seg:1.0.0 -i dicom_input/ -o results/
+```
+
+### Mental Model — How the Three Layers Line Up
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  What you write        →    What Packager generates     │
+├─────────────────────────────────────────────────────────┤
+│  app.py, operators.py  →    /opt/monai/app/*             │
+│  app.yaml (resources)  →    /etc/monai/pkg.json          │
+│  app.yaml (I/O, cmd)   →    /etc/monai/app.json          │
+│  ./models/*            →    /opt/monai/models/*          │
+│  requirements.txt      →    pip install inside Dockerfile│
+│  (Dockerfile)          →    auto-generated by Packager   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Key Takeaways
+
+1. **You never write a Dockerfile** — `monai-deploy package` generates it from `app.yaml` + `requirements.txt`.
+2. **You never write `app.json` or `pkg.json`** — they're derived from your `app.yaml` and your `Application` class.
+3. **Your code is just Python**; MAP-ness comes from the packaging step, not from the runtime code.
+4. **The result is a plain OCI image** that happens to follow a strict internal convention a hospital orchestrator can trust.
+
+
+
+## Model Formats Supported in a MAP
+
+There are **two tiers of support**: what the MAP SDK understands natively (zero extra code), and what you can use through a custom operator or remote inference server.
+
+### Tier 1 — Natively Supported (no custom inference code needed)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Format              │ File(s)        │ SDK class     │
+├──────────────────────┼────────────────┼───────────────┤
+│  TorchScript         │ model.ts       │ TorchScript-  │
+│  (recommended)       │ (or model.pt)  │ Model         │
+│                      │                │               │
+│  MONAI Bundle        │ a folder with  │ MonaiBundle-  │
+│  (TorchScript + JSON │ model.ts +     │ Inference-    │
+│   metadata)          │ configs/...    │ Operator      │
+└──────────────────────────────────────────────────────┘
+```
+
+**TorchScript is the first-class citizen.** The App SDK's built-in model loader is a TorchScript loader — TorchScript serialization format is created by torch.jit.save() and the serialized model usually has .pt or .pth extension. If your model is in TorchScript, you get loading + inference "for free" via the built-in operators.
+
+**MONAI Bundle** is the preferred format if you want zero boilerplate. A MONAI Bundle is essentially a PyTorch model in TorchScript with additional metadata describing the model network and processing specification — the `MonaiBundleInferenceOperator` reads the metadata and automatically wires up pre-/post-transforms, input/output shapes, and the inferer. This is the closest thing to "drop in a model, get a working MAP."
+
+A MONAI Bundle folder looks like:
+
+```
+spleen_ct/
+├── LICENSE
+├── configs/
+│   ├── metadata.json      ← input/output tensor specs, version info
+│   ├── inference.json     ← pre/post-transforms, inferer config
+│   └── train.json         (optional)
+├── models/
+│   ├── model.pt           ← PyTorch state dict  (required)
+│   ├── model.ts           ← TorchScript         (optional but preferred)
+│   └── model.onnx         ← ONNX                (optional)
+└── docs/
+    └── README.md
+```
+
+### Tier 2 — Supported via a Custom Operator
+
+Anything PyTorch/Python can load, you can use — you just write a thin operator to load it and call `forward()`.
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Format          │ Typical file    │ How to use         │
+├──────────────────┼─────────────────┼────────────────────┤
+│  PyTorch weights │ .pt / .pth      │ load in custom op: │
+│  (state dict)    │                 │ model.load_state_  │
+│                  │                 │ dict(torch.load()) │
+│                  │                 │                    │
+│  ONNX            │ .onnx           │ onnxruntime in     │
+│                  │                 │ custom op          │
+│                  │                 │                    │
+│  TensorRT        │ .plan / .engine │ wrap via MONAI     │
+│  (native)        │                 │ trt_export, or     │
+│                  │                 │ use TRT runtime    │
+│                  │                 │                    │
+│  TensorFlow      │ SavedModel/.h5  │ TF runtime in      │
+│                  │                 │ custom op          │
+└────────────────────────────────────────────────────────┘
+```
+
+For TensorRT specifically, MONAI Bundle provides a `trt_export` utility that converts PyTorch → TensorRT engine-based TorchScript, giving you the TensorRT speed while still loading through the normal TorchScript path.
+
+### Tier 3 — Remote Inference via Triton (the escape hatch)
+
+The App SDK also supports **Triton Inference Server** as a backend. This means your MAP doesn't need to contain the model weights at all — it just sends tensors over gRPC to a Triton container. Triton supports essentially every format in production ML: TensorRT, TorchScript, ONNX, TensorFlow SavedModel, OpenVINO, even a Python backend.
+
+This is useful when:
+- The model is huge and you don't want to ship it inside the container
+- Multiple MAPs share one model (load once, serve many)
+- Licensing prevents shipping the weights
+- You need batching/queuing across requests
+
+### Folder Layout Rule (important!)
+
+Regardless of format, the rule is the same: **one subfolder per model**, the subfolder name *is* the model name.
+
+```
+models/                    ← the path passed to -m during packaging
+├── spleen_ct/             ← model name = "spleen_ct"
+│   └── model.ts
+├── pancreas_ct_dints/     ← model name = "pancreas_ct_dints"
+│   └── model.ts
+└── lung_nodule_detector/
+    └── model.ts
+```
+
+The TorchScript files, be it MONAI Bundle compliant or not, must each be placed in a uniquely named folder. At runtime, your inference operator asks for a model by that folder name — which is why the structure matters.
+
+### Practical Recommendation
+
+For your Radiology AI Unit, the priority order I'd suggest:
+
+1. **MONAI Bundle from Model Zoo** — if a pre-trained model exists for your task, this is the fastest path. Plus, anyone in your unit can reproduce your MAP by swapping the bundle folder.
+2. **Your own TorchScript** — if you trained a custom PyTorch model, export it via `torch.jit.script()` or `torch.jit.trace()` and drop it in.
+3. **Custom operator for raw `.pth`** — only if your model has something TorchScript can't serialize (e.g., control flow with dynamic Python types).
+4. **Triton backend** — consider this for multi-model serving across several MAPs in production, not for early-stage deployment.
+
+### Why TorchScript Matters
+
+Two reasons worth knowing as an architecture-minded developer:
+
+```
+  Why not just ship raw .pth weights?
+  ──────────────────────────────────────
+  raw .pth  →  needs original Python class definitions
+              needs matching library versions
+              fragile across refactors
+              Python-interpreter-bound
+
+  TorchScript → self-contained: graph + weights in one file
+              no Python class needed at load time
+              portable across Python versions
+              can run in C++ (LibTorch) without Python
+              enables TensorRT compilation
+```
+
+For clinical deployment, that "no Python class needed" property is the critical one — your MAP doesn't need the exact training-time code, just the serialized graph.

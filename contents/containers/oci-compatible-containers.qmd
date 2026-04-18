@@ -1,0 +1,92 @@
+# OCI-Compatible Containers
+
+## What is OCI?
+
+The **Open Container Initiative (OCI)** is a Linux Foundation project founded in 2015 by Docker, CoreOS, and others. Its goal: standardize container formats and runtimes so no single vendor owns the ecosystem. Before OCI, Docker was the *de facto* standard but proprietary in practice. After OCI, any tool that follows the specs can build, ship, and run containers compatible with every other OCI tool.
+
+Think of OCI as the "USB standard" for containers — the plug shape everyone agrees on.
+
+## The Three OCI Specs
+
+```
+┌──────────────────────────────────────┐
+│        OCI Specifications            │
+├──────────────────────────────────────┤
+│                                      │
+│  1. Image Spec                       │
+│     How images are packaged          │
+│     (layers, manifest, config.json)  │
+│                                      │
+│  2. Runtime Spec                     │
+│     How containers are executed      │
+│     (namespaces, cgroups, mounts)    │
+│                                      │
+│  3. Distribution Spec                │
+│     How images are pushed/pulled     │
+│     (registry HTTP API)              │
+│                                      │
+└──────────────────────────────────────┘
+```
+
+- **Image Spec** — a container image is a tarball with a defined layout: layered filesystem + manifest + config JSON.
+- **Runtime Spec** — defines how to turn an unpacked image ("filesystem bundle") into a running container. Reference implementation: `runc`.
+- **Distribution Spec** — HTTP API for registries (Docker Hub, GHCR, Quay, ECR…).
+
+## The Implementation Stack
+
+Containers are layered. Different tools sit at different levels:
+
+```
+┌────────────────────────────────────────┐
+│  HIGH-LEVEL CLIs (user-facing)         │
+│  Docker │ Podman │ nerdctl │ Buildah   │
+└────────────┬───────────────────────────┘
+             │
+┌────────────▼───────────────────────────┐
+│  ENGINES / DAEMONS                     │
+│  dockerd │ containerd │ CRI-O          │
+└────────────┬───────────────────────────┘
+             │
+┌────────────▼───────────────────────────┐
+│  LOW-LEVEL OCI RUNTIMES                │
+│  runc │ crun │ youki │ kata │ gVisor   │
+└────────────┬───────────────────────────┘
+             │
+┌────────────▼───────────────────────────┐
+│  LINUX KERNEL                          │
+│  namespaces · cgroups · seccomp        │
+└────────────────────────────────────────┘
+```
+
+Key players:
+
+- **Docker** — the original; uses a daemon (`dockerd`). Most familiar ergonomics.
+- **Podman** — daemonless, rootless-first, near-drop-in for the Docker CLI.
+- **containerd** — the engine *inside* Docker; also used directly by Kubernetes.
+- **CRI-O** — minimal runtime built specifically for Kubernetes.
+- **Buildah** — builds images without a daemon (pairs with Podman).
+- **Skopeo** — copies images between registries without pulling locally.
+- **runc / crun / youki** — the low-level thing that actually calls the kernel to create the container.
+
+## Docker vs Podman (the practical comparison)
+
+```
+                Docker                  Podman
+              ─────────               ─────────
+Architecture  client + daemon         daemonless (fork/exec)
+Root needed   historically yes        rootless by default
+CLI           docker ...              podman ... (same commands)
+Pods          via compose only        native pod support
+macOS         hidden Linux VM         `podman machine` VM
+```
+
+On your M3 Pro Mac, both run Linux containers inside a lightweight VM — they're not "native."
+
+## Use Cases
+
+1. **Reproducible dev environments** — one `Dockerfile`, identical behavior on any machine.
+2. **CI/CD pipelines** — build once (GitHub Actions), push to GHCR, deploy anywhere.
+3. **Kubernetes & microservices** — K8s talks to OCI runtimes through the Container Runtime Interface (CRI).
+4. **Medical imaging / ML workflows** — this is directly useful for you: package a radiology AI model with the exact Python, CUDA, MONAI, and pydicom versions pinned. Share it with collaborators who get bit-identical behavior.
+5. **Edge / on-prem hospital deployment** — ship an inference service as a container instead of wrestling with Python environments on each workstation.
+6. **Isolation** — run untrusted code with resource limits.

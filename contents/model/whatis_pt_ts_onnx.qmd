@@ -1,0 +1,348 @@
+---
+title: "What's `pt`, `ts`, `onnx`"
+---
+
+## Overview
+
+`.pt` and `.pth` are **the same thing** — just different file extensions for objects saved by `torch.save()`. TorchScript is a **separate, deployable** format (which also happens to use `.pt`).
+
+### `.pt` vs `.pth`
+
+PyTorch doesn't care which extension you use — `torch.save()` pickles any Python object. Convention leans toward `.pt` because `.pth` collides with Python's "path configuration" files. Both are **Python-pickle** under the hood, meaning you need the original model class code to load them back.
+
+### What lives inside a `.pt` / `.pth`?
+
+Three common shapes, depending on what you passed to `torch.save()`:
+
+```
+┌──────────────────────────────────────────────┐
+│  .pt / .pth  (pickled Python object)         │
+└──────────────────────────────────────────────┘
+
+① state_dict   ← recommended for weights
+   OrderedDict {
+     "conv1.weight": Tensor,
+     "conv1.bias":   Tensor,
+     "fc.weight":    Tensor,
+     ...
+   }
+   Needs model class to reload.
+
+② whole model object   ← fragile, avoid
+   MyModel(nn.Module) + weights + class ref
+   Breaks if you rename/move the class.
+
+③ checkpoint dict   ← for resuming training
+   {
+     "epoch": 42,
+     "model_state_dict":     {...},
+     "optimizer_state_dict": {...},
+     "scheduler_state_dict": {...},
+     "loss": 0.0123,
+   }
+```
+
+### TorchScript
+
+A different beast. Produced by `torch.jit.trace()` (records ops on an example input) or `torch.jit.script()` (parses your Python source into a graph). Saved with `.save()`, usually as `.pt` — which is why people confuse the two.
+
+```
+┌──────────────────────────────────────────────┐
+│  TorchScript module (.pt)                    │
+├──────────────────────────────────────────────┤
+│  • Computational graph (TorchScript IR)      │
+│  • Parameter tensors (weights)               │
+│  • Model methods (forward, etc.)             │
+│  • Self-contained — no Python class needed   │
+└──────────────────────────────────────────────┘
+          │
+          ▼
+   runs in: Python, C++ (LibTorch),
+            mobile (PyTorch Mobile), server
+```
+
+The key property: **TorchScript doesn't need your `.py` source at inference time.** That's what makes it a deployment artifact, not a research artifact.
+
+### Side-by-side
+
+- **state_dict `.pt`** → weights only, needs model class → training & research
+- **whole-model `.pt`** → weights + class ref, brittle → avoid
+- **checkpoint `.pt`** → weights + optimizer + epoch → resume interrupted training
+- **TorchScript `.pt`** → graph + weights, Python-free → production serving
+
+### MLOps takeaway
+
+```
+Train/experiment  ─► state_dict .pt
+Long training run ─► checkpoint .pt
+Ship to prod      ─► TorchScript .pt  (or ONNX)
+```
+
+Common pipeline: train with `state_dict`, then at release time load the model, `torch.jit.script()` or `torch.jit.trace()` it, and save the TorchScript as your deployment artifact. The research `.pt` and the served `.pt` are two different files with two different jobs.
+
+
+## Whole Picture
+
+### The whole picture
+
+```
+                    ┌─────────────────────────┐
+                    │   Define model (.py)    │
+                    │   class ChestXrayNet    │
+                    └───────────┬─────────────┘
+                                │
+                    ┌───────────▼─────────────┐
+                    │      Train loop         │
+                    └───────────┬─────────────┘
+                                │
+         ┌──────────────────────┼──────────────────────┐
+         │                      │                      │
+   ┌─────▼──────┐        ┌──────▼──────┐        ┌──────▼──────┐
+   │ checkpoint │        │ state_dict  │        │   Export    │
+   │   .pt      │        │   .pt       │        │  for prod   │
+   │            │        │             │        │             │
+   │ resume     │        │ best model  │        │ TorchScript │
+   │ training   │        │ for eval/   │        │    or       │
+   │            │        │ research    │        │    ONNX     │
+   └────────────┘        └─────────────┘        └──────┬──────┘
+                                                       │
+                                           ┌───────────┴───────────┐
+                                           │                       │
+                                    ┌──────▼──────┐        ┌───────▼──────┐
+                                    │ LibTorch    │        │ ONNX Runtime │
+                                    │ PyTorch C++ │        │ TensorRT     │
+                                    │ Python      │        │ OpenVINO     │
+                                    └─────────────┘        └──────────────┘
+```
+
+### The model (shared across all examples)
+
+```python
+# model.py
+import torch
+import torch.nn as nn
+
+class ChestXrayNet(nn.Module):
+    """Binary classifier: normal vs. abnormal chest X-ray."""
+
+    def __init__(self, num_classes: int = 2) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Linear(32, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+```
+
+### Dev phase — `state_dict`
+
+```python
+# train.py
+import torch
+from model import ChestXrayNet
+
+model = ChestXrayNet()
+# ... training loop happens here ...
+
+# SAVE: weights only, not the class itself
+torch.save(model.state_dict(), "chestxray_weights.pt")
+```
+
+```python
+# eval.py  (later, possibly on a different machine)
+import torch
+from model import ChestXrayNet           # ← class MUST be importable
+
+# LOAD: rebuild architecture first, then pour weights in
+model = ChestXrayNet()
+state = torch.load("chestxray_weights.pt", map_location="cpu")
+model.load_state_dict(state)
+model.eval()
+```
+
+Key idea: `state_dict` is just weights. You need the Python class to reconstruct the architecture. This is why it's fragile to ship but perfect for research — you can refactor your model code freely.
+
+#### Bonus: full checkpoint (for resuming training)
+
+```python
+# checkpoint.py
+checkpoint = {
+    "epoch": epoch,
+    "model_state_dict": model.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),
+    "scheduler_state_dict": scheduler.state_dict(),
+    "best_val_auc": best_val_auc,
+}
+torch.save(checkpoint, f"ckpt_epoch_{epoch:03d}.pt")
+
+# Resume
+ckpt = torch.load("ckpt_epoch_042.pt", map_location="cpu")
+model.load_state_dict(ckpt["model_state_dict"])
+optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+start_epoch = ckpt["epoch"] + 1
+```
+
+### Ship to prod — TorchScript
+
+```python
+# export_torchscript.py
+import torch
+from model import ChestXrayNet
+
+# 1. Load the trained weights
+model = ChestXrayNet()
+model.load_state_dict(torch.load("chestxray_weights.pt", map_location="cpu"))
+model.eval()
+
+# 2. Convert to TorchScript
+#    Option A — trace: runs the model once with example input, records ops
+example = torch.randn(1, 1, 224, 224)       # (batch, channel, H, W)
+scripted = torch.jit.trace(model, example)
+
+#    Option B — script: parses Python source into TorchScript IR
+#    Use this when the model has data-dependent control flow (if/for)
+# scripted = torch.jit.script(model)
+
+# 3. Save the self-contained artifact
+scripted.save("chestxray_ts.pt")
+```
+
+```python
+# serve.py  (no model.py import needed!)
+import torch
+
+model = torch.jit.load("chestxray_ts.pt", map_location="cpu")
+model.eval()
+with torch.no_grad():
+    logits = model(torch.randn(1, 1, 224, 224))
+```
+
+```cpp
+// serve.cpp — same artifact, C++ inference via LibTorch
+#include <torch/script.h>
+auto model = torch::jit::load("chestxray_ts.pt");
+auto out = model.forward({torch::randn({1, 1, 224, 224})}).toTensor();
+```
+
+### Ship to prod — ONNX
+
+```python
+# export_onnx.py
+import torch
+from model import ChestXrayNet
+
+model = ChestXrayNet()
+model.load_state_dict(torch.load("chestxray_weights.pt", map_location="cpu"))
+model.eval()
+
+dummy = torch.randn(1, 1, 224, 224)
+
+torch.onnx.export(
+    model,
+    dummy,
+    "chestxray.onnx",
+    input_names=["image"],
+    output_names=["logits"],
+    dynamic_axes={                          # allow variable batch size
+        "image":  {0: "batch"},
+        "logits": {0: "batch"},
+    },
+    opset_version=17,
+)
+```
+
+```python
+# serve_onnx.py — runtime is framework-agnostic
+import onnxruntime as ort
+import numpy as np
+
+sess = ort.InferenceSession("chestxray.onnx", providers=["CPUExecutionProvider"])
+img = np.random.randn(1, 1, 224, 224).astype(np.float32)
+logits = sess.run(["logits"], {"image": img})[0]
+```
+
+### What's inside each artifact
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  chestxray_weights.pt  (state_dict — pickled dict)          │
+├─────────────────────────────────────────────────────────────┤
+│  OrderedDict {                                              │
+│    "features.0.weight": Tensor[16, 1, 3, 3],                │
+│    "features.0.bias":   Tensor[16],                         │
+│    "features.3.weight": Tensor[32, 16, 3, 3],               │
+│    "features.3.bias":   Tensor[32],                         │
+│    "classifier.weight": Tensor[2, 32],                      │
+│    "classifier.bias":   Tensor[2],                          │
+│  }                                                          │
+│  ✗ No architecture   ✗ No forward()   ✗ Needs model.py      │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  ckpt_epoch_042.pt  (training checkpoint)                   │
+├─────────────────────────────────────────────────────────────┤
+│  {                                                          │
+│    "epoch": 42,                                             │
+│    "model_state_dict":     { ... weights ... },             │
+│    "optimizer_state_dict": { momentum buffers, lr, ... },   │
+│    "scheduler_state_dict": { last_epoch, ... },             │
+│    "best_val_auc": 0.913,                                   │
+│  }                                                          │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  chestxray_ts.pt  (TorchScript — ZIP archive)               │
+├─────────────────────────────────────────────────────────────┤
+│  ├── code/                    ← TorchScript IR (graph)      │
+│  │     __torch__.ChestXrayNet.forward                       │
+│  │        %x = aten::conv2d(%input, %w0, %b0, ...)          │
+│  │        %x = aten::relu_(%x)                              │
+│  │        %x = aten::max_pool2d(%x, ...)                    │
+│  │        ...                                               │
+│  ├── data/                    ← parameter tensors           │
+│  │     0.bin  (conv1.weight)                                │
+│  │     1.bin  (conv1.bias)                                  │
+│  │     ...                                                  │
+│  └── constants.pkl                                          │
+│  ✓ Self-contained   ✓ No Python needed at runtime           │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  chestxray.onnx  (ONNX — protobuf graph)                    │
+├─────────────────────────────────────────────────────────────┤
+│  graph {                                                    │
+│    input:  "image"   float[batch, 1, 224, 224]              │
+│    output: "logits"  float[batch, 2]                        │
+│                                                             │
+│    node { op: "Conv",    in: image, w0, b0  → x1 }          │
+│    node { op: "Relu",    in: x1             → x2 }          │
+│    node { op: "MaxPool", in: x2             → x3 }          │
+│    node { op: "Conv",    in: x3, w1, b1     → x4 }          │
+│    node { op: "Relu",    in: x4             → x5 }          │
+│    node { op: "GlobalAveragePool", ...      → x6 }          │
+│    node { op: "Flatten", in: x6             → x7 }          │
+│    node { op: "Gemm",    in: x7, w2, b2     → logits }      │
+│                                                             │
+│    initializer { w0, b0, w1, b1, w2, b2 }  ← weights        │
+│  }                                                          │
+│  ✓ Framework-agnostic   ✓ Runs on ORT, TensorRT, etc.       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Choosing between TorchScript and ONNX
+
+**TorchScript** stays in the PyTorch family — easiest export, great if you serve with TorchServe or LibTorch, and it handles most PyTorch ops faithfully. Downside: you're locked to the PyTorch runtime.
+
+**ONNX** is the interoperability format — same model can run on ONNX Runtime (CPU/GPU), NVIDIA TensorRT (fast GPU), Intel OpenVINO (fast CPU), or even in the browser via onnxruntime-web. Downside: some exotic PyTorch ops don't map cleanly, and you may need to tweak the model for clean export.
+
+For medical imaging specifically, ONNX + ONNX Runtime is often the sweet spot: it gives you a clear deployment contract, works well with DICOM pipelines written in C#/.NET or Python, and is easy to version as an MLOps artifact.

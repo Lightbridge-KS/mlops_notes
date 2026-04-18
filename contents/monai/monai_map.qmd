@@ -1,0 +1,205 @@
+---
+title: "MONAI Application Package (MAP)"
+---
+
+
+## What MAP Is
+
+A **MAP is an OCI-compliant container** (i.e., a Docker/Podman image following the Open Container Initiative spec) that packages a medical imaging AI model together with everything it needs to run in a clinical environment — DICOM parsing, preprocessing, inference, post-processing, and DICOM-standard output emission.
+
+Think of it as: **"A MONAI Bundle + DICOM-aware operators + a runtime contract, all sealed in a container."**
+
+Per the MONAI Deploy docs, *"A MAP uses a bundle as the inference object."* MAP is built using the **MONAI Deploy App SDK** (Python).
+
+Where it sits in the packaging hierarchy:
+
+```
+┌───────────────────────────────────────────────────┐
+│  MAP (OCI container, shippable artifact)          │
+│  ┌─────────────────────────────────────────────┐  │
+│  │  MONAI Deploy App SDK runtime               │  │
+│  │  (Operator DAG executor)                    │  │
+│  │  ┌───────────────────────────────────────┐  │  │
+│  │  │  MONAI Bundle                         │  │  │
+│  │  │  (metadata.json, inference.json,      │  │  │
+│  │  │   weights — ONNX / TorchScript / .pt) │  │  │
+│  │  └───────────────────────────────────────┘  │  │
+│  └─────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────┘
+```
+
+Each outer layer adds something the inner one cannot provide: the Bundle gives a **preprocessing contract**, the App SDK gives an **executable DAG of Operators**, and the OCI shell gives **portability + signing (Cosign) + SBOM**.
+
+---
+
+## MAP Internal Structure — Operator DAG
+
+Inside a MAP, execution is a directed acyclic graph of **Operators** (Python classes). A typical chest-CT segmentation MAP looks like this:
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │                    MAP Runtime (App SDK)                 │
+  │                                                          │
+  │   /var/monai/input/                                      │
+  │         │                                                │
+  │         ▼                                                │
+  │   ┌───────────────────┐                                  │
+  │   │ DICOMDataLoader   │ ← reads DICOM series             │
+  │   │     Operator      │                                  │
+  │   └─────────┬─────────┘                                  │
+  │             │                                            │
+  │             ▼                                            │
+  │   ┌───────────────────┐                                  │
+  │   │ SeriesSelector    │ ← picks right series             │
+  │   │     Operator      │   by Modality/BodyPart/etc.      │
+  │   └─────────┬─────────┘                                  │
+  │             │                                            │
+  │             ▼                                            │
+  │   ┌───────────────────┐                                  │
+  │   │ Series-to-Volume  │ ← pixel array + spacing          │
+  │   │  Converter        │   + orientation (RAS/LPS)        │
+  │   └─────────┬─────────┘                                  │
+  │             │                                            │
+  │             ▼                                            │
+  │   ┌───────────────────┐                                  │
+  │   │ MonaiBundle       │ ← runs Compose([LoadImaged,      │
+  │   │  InferenceOp      │   Orientationd, Spacingd,        │
+  │   │  (wraps Bundle)   │   ScaleIntensityRanged,          │
+  │   │                   │   SlidingWindowInferer])         │
+  │   └─────────┬─────────┘                                  │
+  │             │                                            │
+  │             ▼                                            │
+  │   ┌───────────────────┐                                  │
+  │   │ DICOMSegWriter    │ ← highdicom-based SEG            │
+  │   │ / SRWriter /      │   (Supplement 111)               │
+  │   │ ParametricMap     │   SR TID 1500 via Sup 219        │
+  │   └─────────┬─────────┘                                  │
+  │             │                                            │
+  │             ▼                                            │
+  │   /var/monai/output/   → STOW-RS back to PACS            │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
+```
+
+Two ideas are important here. First, the **DICOM-aware Operators** are what separate MAP from a generic ML container — a plain Triton deployment gives you `tensor in, tensor out`, but those Operators are where orientation flips, HU clipping, and SEG geometry mismatches are handled. Second, the **inference Operator wraps the Bundle** — so the Bundle is the "brain" and the MAP is the "body with hands that speak DICOM."
+
+---
+
+## How a MAP Is Built
+
+Using the MONAI Deploy App SDK:
+
+```python
+# my_app.py (conceptual)
+from monai.deploy.core import Application
+from monai.deploy.operators import (
+    DICOMDataLoaderOperator,
+    DICOMSeriesSelectorOperator,
+    DICOMSeriesToVolumeOperator,
+    MonaiBundleInferenceOperator,
+    DICOMSegmentationWriterOperator,
+)
+
+class LungSegApp(Application):
+    def compose(self):
+        loader   = DICOMDataLoaderOperator(self)
+        selector = DICOMSeriesSelectorOperator(self, rules=CT_RULES)
+        to_vol   = DICOMSeriesToVolumeOperator(self)
+        infer    = MonaiBundleInferenceOperator(self, bundle_path="./bundle")
+        writer   = DICOMSegmentationWriterOperator(self, segment_descriptions=...)
+        self.add_flow(loader, selector)
+        self.add_flow(selector, to_vol)
+        self.add_flow(to_vol, infer)
+        self.add_flow(infer, writer)
+```
+
+Then you run one command — `monai-deploy package my_app.py --tag lung-seg:v1.0` — and the SDK produces a **signable OCI image** with a `/etc/monai/app.json` manifest describing inputs, outputs, resources, and timeout.
+
+---
+
+## Integration into Your Orchestration Platform
+
+This is where MAP matters for the AI Smart Orchestration Platform. It fits cleanly between the **DICOM boundary** (PACS ↔ platform) and the **model serving layer**:
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                   Ramathibodi Hospital                       │
+  │   Fujifilm Synapse PACS  ──DIMSE/DICOMweb──┐                 │
+  └────────────────────────────────────────────┼─────────────────┘
+                                               │
+                                               ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │            AI Smart Orchestration Platform                   │
+  │                                                              │
+  │   ┌──────────────────────────┐                               │
+  │   │  MONAI Informatics       │  DICOM ingress + FHIR         │
+  │   │  Gateway (MIG)  [C#]     │  ACL (anti-corruption layer)  │
+  │   └──────────┬───────────────┘                               │
+  │              │ workflow request                              │
+  │              ▼                                               │
+  │   ┌──────────────────────────┐   ┌────────────────────────┐  │
+  │   │  Workflow Manager        │──▶│  mercure DICOM         │  │
+  │   │  (MONAI Deploy or        │   │  Orchestrator (rules)  │  │
+  │   │   Argo / Flyte)          │   └────────┬───────────────┘  │
+  │   └──────────────────────────┘            │                  │
+  │                                           │ docker run MAP   │
+  │                                           ▼                  │
+  │   ┌──────────────────────────────────────────────────────┐   │
+  │   │   MAP Execution Pool (Kubernetes / Docker)           │   │
+  │   │                                                      │   │
+  │   │   [MAP: CXR-TB v1.2]   [MAP: LungNodule v2.0]        │   │
+  │   │   [MAP: Brain-ICH v1.0] [MAP: ...]                   │   │
+  │   │   (each MAP = isolated container, pinned GPU)        │   │
+  │   └──────────────────────────────────────────────────────┘   │
+  │                          │                                   │
+  │                          ▼                                   │
+  │   ┌──────────────────────────────────────────────────────┐   │
+  │   │  Output emitters: DICOM SEG / SR TID 1500 /          │   │
+  │   │  Parametric Map → STOW-RS → PACS                     │   │
+  │   │  FHIR Observation → Health Link / EHR                │   │
+  │   │  HL7 v2 ORU^R01  → HOSxP                             │   │
+  │   └──────────────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+MAP is the **execution unit** at the blue arrow. The orchestrator decides *which* MAP to run (by rules over StudyDescription, BodyPart, Modality); the MAP decides *what to do* once it has the DICOM. This is exactly the separation of concerns that DDD would push you toward — the orchestrator's bounded context is routing, the MAP's bounded context is a single clinical AI task.
+
+### Why this matters architecturally
+
+- **Isolation.** Each MAP has its own Python env, its own CUDA version, its own dependencies. No dependency hell across 10+ concurrent models.
+- **Versioning.** `cxr-tb:v1.2` is a SHA-256-pinned, Cosign-signable OCI reference. This is the single most important property for FDA PCCP / IEC 62304 configuration management.
+- **Portability.** The same MAP runs in mercure, Siemens Digital Marketplace, AI Centre VBH, and any K8s cluster. Write once, deploy anywhere (that is OCI-aware).
+- **DDD fit.** MAP is a **Designed Published Language** for the deployment context — the boundary artifact between the ML team (who produce it) and the platform team (who execute it).
+
+---
+
+## Use Cases for Your Platform
+
+### Use case 1 — Packaging an in-house Rama model
+
+You train a chest X-ray TB classifier in PyTorch at Rama. Export it as a MONAI Bundle, wrap it in a MAP, push `ramaai-dev/cxr-tb:v1.0` to your GitHub Container Registry, and mercure routes every chest X-ray to it. The radiologist sees the result as a DICOM SR in Synapse PACS.
+
+### Use case 2 — A/B testing two versions of a model
+
+Deploy `cxr-tb:v1.0` and `cxr-tb:v1.1` side-by-side. Shadow-mode route 10% of studies to v1.1; emit both results to your PMS (post-market surveillance) dashboard; compare drift and clinician agreement. OCI tags make this a trivial configuration change, not a deployment.
+
+### Use case 3 — Integrating a vendor's MAP
+
+If a Thai AI vendor ships a MAP (and the Published Languages report flags this as *emerging* cross-vendor), your platform can execute it natively — no vendor-specific SDK to integrate. This is the "marketplace" vision.
+
+### Use case 4 — Sandbox / PIE environment
+
+The PRD's Pre-Installation Evaluation needs a contained, reproducible test environment. A MAP is the ideal unit: pull the MAP, run it against de-identified test DICOM, check outputs, tear down. Nothing leaks into the host.
+
+### Use case 5 — Regulatory evidence
+
+When Thai FDA or internal ethics asks "what exactly is running on the TB model as of last Tuesday?", the answer is an OCI digest: `sha256:abc…`. That digest pins the Bundle, the preprocessing transforms, the weights, and the OS layers. This is the audit trail IEC 62304 expects.
+
+---
+
+## Honest Limits (worth knowing before you commit)
+
+- **Governance is NVIDIA-led.** Project MONAI is Apache 2.0 and community-contributed, but the direction comes from NVIDIA. If NVIDIA pivots, you inherit the direction.
+- **No major non-MONAI radiology vendor accepts MAP as a shipping format.** GE, Philips, Canon, Fujifilm, Sectra — none treat MAP as first-class. Useful for in-house and mercure; not a universal vendor contract.
+- **Supply-chain tooling is weaker than ModelPack/KitOps.** MAP supports Cosign signing (because it's OCI), but CNCF ModelPack has the better SLSA/Rekor/SBOM story. The 2026 "defensible stack" per the research is layered: *OCI image (MAP) → Bundle inside → ONNX weights → Model Card → Sigstore + Rekor*.
+- **Operator DAG is less expressive than Ray Serve or KServe inference graphs** for complex multi-model routing. MAP = single clinical task; orchestrator = routing between tasks.

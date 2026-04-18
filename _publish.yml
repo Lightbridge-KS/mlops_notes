@@ -1,0 +1,4 @@
+- source: project
+  netlify:
+    - id: 5d66ff2d-3510-472b-af98-7502b16543e8
+      url: https://mlops-notes-lightbridge.netlify.app

@@ -1,0 +1,34 @@
+project:
+  type: book
+
+book:
+  title: "MLOps Notes"
+  author: "Kittipos Sirivongrungson"
+  date: today
+  repo-url: https://github.com/Lightbridge-KS/mlops-notes
+  site-url: https://mlops-notes-lightbridge.netlify.app
+  chapters:
+    - index.qmd
+    - part: Model Format
+      chapters: 
+        - text: ".pt, .ts, .onnx"
+          href: "contents/model/whatis_pt_ts_onnx.qmd"
+    - part: Packages & Containers
+      chapters:
+        - text: "OCI-Compatible Container"
+          href: "contents/containers/oci-compatible-containers.qmd"
+        - text: "MONAI Application Package (MAP)"
+          href: "contents/monai/monai_map.qmd"
+        - text: "MAP Example"
+          href: "contents/monai/nonai_map_example.qmd"
+
+format:
+  html:
+    theme:
+      light:
+      - cosmo
+      dark: 
+      - darkly
+    toc-depth: 4
+
+freeze: auto
