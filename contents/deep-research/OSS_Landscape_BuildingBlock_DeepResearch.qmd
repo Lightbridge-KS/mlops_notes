@@ -1,0 +1,209 @@
+---
+title: "Open-source building blocks for a hospital AI orchestration platform"
+---
+
+**The open-source ecosystem already contains nearly every component needed to build a hospital-based AI Smart Orchestration Platform — no single project covers the full PRD, but a carefully composed stack of 8–12 projects can.** The MONAI Deploy ecosystem emerges as the clear foundation for medical imaging AI orchestration with native DICOM/FHIR integration, while Kaapana represents the closest existing end-to-end platform (deployed at **36 German university hospitals**). For monitoring and evaluation, Evidently AI combined with NannyML provides the strongest open-source coverage of drift detection and post-market surveillance. MLflow remains the de facto standard for model registry and experiment tracking. This report catalogs **35+ projects** across four axes and maps each to your PRD components.
+
+---
+
+## Axis 1: AI orchestration and model serving — 12 projects evaluated
+
+This axis covers the core infrastructure for routing inference requests, managing concurrent model deployments, and connecting to hospital data systems. The landscape splits cleanly into **healthcare-specific orchestrators** (MONAI Deploy, mercure) and **general-purpose model serving platforms** (KServe, Ray Serve, Triton) that require custom healthcare integration.
+
+### Healthcare-specific orchestration
+
+| Project | Stars | License | What it does | Adopt vs. Learn |
+|---------|-------|---------|-------------|-----------------|
+| **MONAI Deploy** (App SDK + Informatics Gateway + Workflow Manager) | ~122–7.9K across repos | Apache 2.0 | Complete clinical deployment pipeline: packages AI models as MONAI Application Packages (MAPs), handles DICOM/FHIR I/O with hospital systems, orchestrates inference workflows. C#/.NET gateway, Python SDK. | **Adopt** — deployed at 10,000+ institutions via Siemens |
+| **mercure DICOM Orchestrator** | 91 | MIT | Rule-based DICOM routing to AI processing pipelines with native MONAI MAP support. Web UI for monitoring and audit trails. Developed at NYU Langone Health. | **Adopt** — production-ready for radiology AI routing |
+| **AIDE** (AI Deployment Engine) | Limited public repos | Open source | NHS clinical AI deployment platform built on MONAI ecosystem. Regulatory compliance, clinical review workflows, admin management. | **Learn/Reference** — deployed across 10+ NHS Trusts (18M patients) but tightly coupled to NHS infrastructure |
+
+**MONAI Deploy's Informatics Gateway** is the single most important component for your data ingestion layer — it natively handles DICOM DIMSE, DICOMweb, and FHIR, connecting directly to HIS/RIS/PACS systems. The Workflow Manager provides orchestration logic, and the App SDK standardizes model packaging into containerized MAPs that any compliant orchestrator can execute.
+
+### General-purpose model serving
+
+| Project | Stars | License | Tech stack | Key strength | Adopt vs. Learn |
+|---------|-------|---------|-----------|-------------|-----------------|
+| **KServe** | ~5,300 | Apache 2.0 | Go, Python, K8s, Knative | CNCF incubating; standardized K8s-native serving with autoscaling, canary deployments, inference graphs. Multi-framework (TF, PyTorch, ONNX, Triton). | **Adopt** as model serving layer |
+| **NVIDIA Triton Inference Server** | ~8,500 | BSD-3-Clause | C++, Python, Docker, K8s | GPU-optimized high-performance inference with dynamic batching, model ensembles. Native MONAI Deploy integration. | **Adopt** for GPU inference |
+| **Ray Serve** | ~36,000 (Ray total) | Apache 2.0 | Python, K8s (KubeRay) | Programmable multi-model composition in Python; ideal for complex routing (triage → specialist model). Fractional GPU allocation. | **Adopt** for complex routing logic |
+| **BentoML** | ~7,600 | Apache 2.0 | Python, Docker, REST/gRPC | Packages models into portable "Bentos" with auto-generated APIs. Excellent DX for rapid prototyping. | **Adopt** for model packaging |
+| **Kubeflow** | ~14,000 | Apache 2.0 | Python, Go, K8s | End-to-end MLOps: pipelines, training, tuning, serving (via KServe). Google-originated. | **Adopt** for full MLOps pipeline |
+| **Flyte** | ~6,000 | Apache 2.0 | Go, Python, K8s | CNCF graduated; strongly-typed reproducible workflows with built-in versioning and audit — well-suited for regulated environments. | **Adopt** for pipeline orchestration |
+| **Portkey AI Gateway** | ~10,200 | MIT | TypeScript, Node.js | Routes to 200+ LLMs with guardrails, fallbacks, caching. SOC2/HIPAA/GDPR compliant. | **Adopt** if using clinical LLMs |
+| **LitServe** | ~3,000 | Apache 2.0 | Python, FastAPI | Lightweight model serving with batching and GPU autoscaling. 2x faster than plain FastAPI. | **Learn** — good for prototyping |
+| **Seldon Core** | ~4,400 | **BSL 1.1** ⚠️ | Python, Go, K8s | Inference graphs, A/B testing, drift detection via Alibi. Excellent architecture but $18K/yr commercial license since Jan 2024. | **Learn only** — license prohibits free commercial use |
+
+**Recommended orchestration stack**: MONAI Deploy (healthcare integration) + KServe or Ray Serve (model serving) + Triton (GPU inference). This combination covers DICOM/FHIR ingestion, workflow orchestration, multi-model deployment, and high-performance inference. Portkey adds LLM routing if clinical NLP is in scope.
+
+---
+
+## Axis 2: AI evaluation and monitoring spans 12 tools plus FUTURE-AI
+
+This axis is critical for regulatory compliance (ISO 13485, IEC 62304, ISO/IEC 42001) and maps directly to your PIE and PMS requirements. The landscape is rich but fragmented — no single tool covers drift detection, bias/fairness, explainability, and data quality together.
+
+### Core monitoring and drift detection
+
+| Project | Stars | License | Capabilities | Healthcare relevance |
+|---------|-------|---------|-------------|---------------------|
+| **Evidently AI** | ~6,400 | Apache 2.0 | **100+ metrics** for drift (PSI, KS, Wasserstein, Jensen-Shannon), performance monitoring, data quality. Self-hostable dashboard. Test suites with pass/fail for CI/CD. | Adaptable — domain-agnostic but customizable. Test Suite → Monitoring workflow maps directly to PIE → PMS lifecycle. |
+| **NannyML** | ~183 | Apache 2.0 | **Estimates model performance WITHOUT ground truth** using CBPE/DLE algorithms. Links drift alerts to performance impact. | **Uniquely valuable** — medical AI often lacks timely ground truth (clinical outcomes delayed weeks/months). Only OSS tool with this capability. |
+| **whylogs** (WhyLabs) | ~2,500 | Apache 2.0 | Privacy-preserving statistical profiling (~1% overhead). Distribution monitoring, data constraints. No raw data stored. | **HIPAA-compatible architecture** — profiles contain only statistical summaries, never patient data. |
+| **Alibi Detect** | ~2,200 | **BSL** ⚠️ | Most sophisticated drift algorithms: MMD, LSDD, deep kernel methods. Supports images, text, time series. Online + offline detection. | Best for **medical image drift detection** (radiology AI). BSL license needs evaluation. |
+| **Deepchecks** | ~3,600 | **AGPL 3.0** ⚠️ | Lifecycle validation: data integrity, train-test validation, model evaluation, production monitoring. Tabular + CV + NLP. | Strong for structured pre-deployment testing (PIE). AGPL may be restrictive for hospital deployment. |
+
+**Evidently AI is the recommended backbone** for monitoring — its modular architecture, Apache 2.0 license, and comprehensive metric library make it the strongest single tool. Pair it with NannyML for the critical capability of estimating performance when ground truth labels are delayed (common in clinical settings where outcomes may take months to materialize).
+
+### Bias, fairness, and explainability
+
+| Project | Stars | License | Focus area | Healthcare use |
+|---------|-------|---------|-----------|---------------|
+| **IBM AIF360** | ~2,800 | Apache 2.0 | **70+ fairness metrics**, 10+ mitigation algorithms (pre/in/post-processing). | **Includes healthcare tutorial** (Medical Expenditure Panel Survey). Gold standard for fairness evaluation. |
+| **Fairlearn** | ~2,200 | MIT | Fairness metrics + mitigation (ExponentiatedGradient, ThresholdOptimizer). Scikit-learn compatible. | Lighter-weight alternative to AIF360. Better maintained for practical use. |
+| **SHAP** | ~23,000 | MIT | Shapley value-based model explanations. Local + global feature importance. Deep learning support. | **Extensively validated in medical AI literature.** Essential for FUTURE-AI Explainability principle. |
+| **Giskard** | ~4,700 | Apache 2.0 | Automated vulnerability scanning, bias detection, adversarial testing. V3 adds LLM evaluation. giskard-vision for CV. | Strong for pre-deployment adversarial testing. Vision module relevant for medical imaging validation. |
+| **Microsoft RAI Toolbox** | ~1,500 | MIT | Unified dashboard: error analysis, fairness (Fairlearn), explainability (InterpretML), counterfactuals, causal inference. | **Best reference architecture** for integrated governance dashboard combining multiple evaluation dimensions. |
+| **Google What-If Tool** | ~3,000 | Apache 2.0 | Interactive model probing, fairness visualization, what-if analysis. TensorBoard integration. | Good for clinical researchers exploring model behavior interactively before deployment. |
+
+### Data quality
+
+| Project | Stars | License | What it does |
+|---------|-------|---------|-------------|
+| **Great Expectations** | ~10,000 | Apache 2.0 | Declarative data quality validation with auto-generated documentation. Industry standard for data pipeline testing. Maps to ISO 13485 data traceability requirements. |
+
+### FUTURE-AI framework
+
+The **FUTURE-AI framework** (published in BMJ, Feb 2025) is not a tool but the **governance standard** your platform should implement. Developed by 117 experts from 50 countries, it defines six principles — **F**airness, **U**niversality, **T**raceability, **U**sability, **R**obustness, **E**xplainability — with 30 actionable best practices covering the full AI lifecycle. The mapping to tools:
+
+- **Fairness** → AIF360 + Fairlearn
+- **Universality** → Evidently (generalizability testing across patient populations)
+- **Traceability** → whylogs (data logging) + Great Expectations (data lineage) + MLflow (model lineage)
+- **Usability** → Microsoft RAI Dashboard (reference UX)
+- **Robustness** → Alibi Detect (adversarial detection) + NannyML (performance estimation) + Evidently (drift)
+- **Explainability** → SHAP + InterpretML
+
+---
+
+## Axis 3: Model registry and sandbox require a layered approach
+
+No single project delivers a complete model registry with sandbox/testbed capabilities for healthcare. The recommended approach layers **MLflow** (registry + experiment tracking) with **DVC** (data versioning + audit trails) and healthcare-specific validation tools.
+
+### Model registry and experiment tracking
+
+| Project | Stars | License | Registry | Experiment tracking | Governance features |
+|---------|-------|---------|----------|--------------------|--------------------|
+| **MLflow** | **24,100** | Apache 2.0 | ✅ Model aliases (@champion, @staging, @production), lifecycle stages, lineage | ✅ Comprehensive (params, metrics, artifacts) | Model approval workflows, stage transitions, audit trail. **60M+ monthly downloads.** |
+| **ClearML** | ~6,000 | Apache 2.0 (SDK) / **SSPL** (server) ⚠️ | ✅ Model snapshots with central storage | ✅ Auto-magical logging | RBAC, SSO, audit logs (enterprise). clearml-session launches remote JupyterLab in Docker (sandbox). |
+| **DVC** | 15,500 | Apache 2.0 | Partial (Git-based model/data versioning) | ✅ Experiment management | **Git-based audit trail** — every change tracked. Critical for regulatory compliance. Acquired by lakeFS/Treeverse Nov 2025. |
+| **ZenML** | ~5,500 | Apache 2.0 | Via integrations (MLflow, etc.) | Via integrations | SOC2/ISO 27001. Data stays on hospital infrastructure. EU AI Act compliance example. |
+| **Kubeflow Model Registry** | ~200 | Apache 2.0 | ✅ K8s-native, OpenAPI-first, RBAC via OpenShift | ❌ (complements trackers) | Red Hat-backed with 12+ month maintenance commitment. Alpha status. |
+| **Aim** | 5,700 | Apache 2.0 | ❌ No model registry | ✅ Excellent (handles 100K+ sequences) | Fully self-hosted, no external dependencies. Development has slowed. |
+| **MONAI Model Zoo / Bundle** | Part of MONAI | Apache 2.0 | ✅ 25+ pre-trained medical imaging models; Bundle format encapsulates weights + metadata + transforms + legal info | Via MONAI Core | **Healthcare-specific** model packaging standard gaining industry adoption. |
+
+**MLflow is the clear winner** for model registry — it has **10x the community** of alternatives, Apache 2.0 licensing, and the most mature registry features. For healthcare compliance, layer DVC underneath for Git-based data provenance and audit trails. The MONAI Bundle format provides the healthcare-specific model packaging standard that should define how models are cataloged.
+
+### Sandbox and testbed
+
+| Project | Stars | License | What it provides |
+|---------|-------|---------|-----------------|
+| **Microsoft Healthcare AI Model Evaluator (HAIME)** | 37 | MIT | Purpose-built healthcare evaluation environment with Arena interface for model comparison, Elo rankings, multi-reviewer support, expert clinical validation workflows. Currently focused on LLMs. |
+| **Epic AI Trust & Assurance Suite** | New (2025) | Open source | Automates AI validation within EHR context. Demographic fairness dashboards. Standardized monitoring template. Being validated by Duke Health, UW Health via HAIP network. |
+| **ClearML Sessions** | Part of ClearML | Apache 2.0 (SDK) | Launches isolated JupyterLab/VSCode environments inside Docker containers for model experimentation. Fractional GPU support. |
+| **Kaapana** | ~200 | **AGPL 3.0** ⚠️ | Integrated JupyterLab + 3D Slicer sandbox within the platform. Full isolated development environment connected to de-identified PACS data. |
+| **Deepchecks** | 3,600 | **AGPL 3.0** ⚠️ | Built-in test suites (data_integrity, train_test_validation, model_evaluation, production_suite) act as automated validation gates before deployment. |
+
+For the **AI Testbed/Sandbox** specifically, no off-the-shelf project fully matches the PRD's vision of an isolated environment for testing with de-identified data. The recommended approach combines **Kaapana's integrated sandbox** (if AGPL is acceptable) or **ClearML Sessions** (for compute isolation) with **Deepchecks** (for automated validation gates) and **HAIME** (for clinical expert review workflows). Kubernetes namespaces or separate clusters provide the infrastructure isolation.
+
+---
+
+## Axis 4: Healthcare-specific platforms anchor the architecture
+
+These projects understand medical data formats, clinical workflows, and healthcare regulations natively — they should form the foundation upon which general-purpose tools are layered.
+
+### The MONAI ecosystem is the center of gravity
+
+**MONAI** (Medical Open Network for AI) is backed by NVIDIA, King's College London, Mayo Clinic, and Siemens Healthineers. It spans the full lifecycle:
+
+- **MONAI Core** (~8,000 stars, Apache 2.0): PyTorch-based training framework with domain-specific transforms, networks, losses, and metrics for medical imaging. Used at thousands of institutions.
+- **MONAI Deploy**: Clinical deployment (covered in Axis 1). The MAP standard is gaining industry adoption for containerized medical AI apps.
+- **MONAI Label** (819 stars, Apache 2.0): AI-assisted annotation with active learning. Integrates with 3D Slicer and OHIF. Server-side inference for interactive segmentation.
+
+### Kaapana: the closest existing end-to-end platform
+
+**Kaapana** (~200 stars, AGPL 3.0) is the single project most similar to your PRD's vision. Built by the German Cancer Research Center (DKFZ) and deployed across **all 36 German university hospitals** via the RACOON network, it integrates:
+
+- **dcm4chee** as PACS (DICOM DIMSE + DICOMweb)
+- **Apache Airflow** for workflow orchestration (DAG-based)
+- **MinIO** for object storage
+- **Keycloak** for identity management and RBAC
+- **Prometheus + Grafana** for monitoring dashboards
+- **OHIF Viewer** for medical image visualization
+- **JupyterLab** for development sandbox
+- Federated learning support
+- nnU-Net and TotalSegmentator pre-built workflows
+
+The **AGPL license** is its primary limitation for hospital adoption — any modifications must be open-sourced, and network use triggers copyleft obligations. However, as a **reference architecture**, it is invaluable.
+
+### Complementary healthcare-specific projects
+
+| Project | Stars | License | Role in platform |
+|---------|-------|---------|-----------------|
+| **OHIF Viewer** | ~3,200 | MIT | Standard web-based DICOM viewer. V3.10 includes local AI segmentation. Foundation for dashboard/clinician UX. |
+| **OHIF-AI** (CCI-Bonn fork) | New | MIT | Adds server-side AI integration to OHIF: SAM2, MedSAM2, nnInteractive, MedGemma for segmentation and report generation. |
+| **Orthanc** | ~800 | GPLv3 | Lightweight PACS server with Python plugin for AI integration and DICOMweb support. |
+| **HealthChain** | ~500 | Apache 2.0 | Python SDK for FHIR/EHR integration (Epic CDS Hooks), NLP pipelines, CDA↔FHIR conversion. **Best tool for FHIR/EHR integration.** |
+| **NVIDIA FLARE** | ~700 | Apache 2.0 | Production-grade federated learning. Used by 20+ hospital federations for COVID-19, cancer research. |
+| **OpenFL** | ~700 | Apache 2.0 | Intel-backed FL framework. Powers FeTS platform (59 institutions worldwide). |
+| **OHDSI PatientLevelPrediction** | ~300 | Apache 2.0 | R package for building/validating predictive models on **OMOP CDM data**. Used across 100+ OHDSI institutions. |
+| **QuPath** | ~1,200 | GPLv3 | Digital pathology analysis. Cited in thousands of publications. |
+| **PathML** | ~600 | GPLv3 | Python toolkit for computational pathology (160+ image formats). |
+
+---
+
+## Projects that span multiple axes deserve special attention
+
+Several projects appear across multiple axes and provide outsized value:
+
+**MONAI Deploy** spans Axis 1 (orchestration) + Axis 3 (model registry via Bundle format) + Axis 4 (healthcare-specific). It is the single most important project for this platform.
+
+**Kaapana** spans all four axes — orchestration (Airflow), monitoring (Prometheus/Grafana), sandbox (JupyterLab), and healthcare-specific (PACS/OHIF integration). Its AGPL license is the main barrier.
+
+**Evidently AI** spans Axis 2 (monitoring) + Axis 3 (validation testing). Its test suites serve as pre-deployment validation gates, and its monitoring dashboard provides post-deployment surveillance.
+
+**MLflow** spans Axis 1 (model serving integration) + Axis 3 (model registry). It connects experiment tracking through to production deployment.
+
+**Deepchecks** spans Axis 2 (drift/performance monitoring) + Axis 3 (validation testbed). Its built-in test suites function as automated pre-deployment gates.
+
+---
+
+## Recommended architecture maps PRD components to specific projects
+
+The following table maps each PRD component to the recommended open-source project(s), prioritizing Apache 2.0/MIT licenses and healthcare-proven deployments:
+
+| PRD component | Primary recommendation | Secondary / complementary | License risk |
+|---------------|----------------------|--------------------------|--------------|
+| **Data Ingestion** (FHIR, DICOMweb, OMOP) | MONAI Deploy Informatics Gateway (DICOM/FHIR) + HealthChain (EHR/CDS Hooks) | Orthanc (PACS), OHDSI PLP (OMOP) | GPLv3 for Orthanc |
+| **Orchestration Layer** | MONAI Deploy Workflow Manager + KServe (model serving) | mercure (DICOM routing), Ray Serve (complex routing), Flyte (pipelines) | Clean (Apache 2.0) |
+| **High-performance inference** | NVIDIA Triton Inference Server | BentoML (packaging), LitServe (lightweight) | Clean (BSD-3/Apache 2.0) |
+| **AI Model Registry** | MLflow (registry + tracking) + MONAI Bundle (healthcare model format) | DVC (data versioning), Kubeflow Model Registry (K8s-native) | Clean (Apache 2.0) |
+| **Evaluation — PIE** | Evidently (test suites) + Deepchecks (validation) + Giskard (adversarial) | AIF360/Fairlearn (fairness), SHAP (explainability) | AGPL for Deepchecks |
+| **Monitoring — PMS** | Evidently (dashboard) + NannyML (ground-truth-free estimation) | whylogs (privacy-preserving profiling), Alibi Detect (image drift) | BSL for Alibi Detect |
+| **Bias/Fairness** | AIF360 (comprehensive) + Fairlearn (lightweight) | Giskard (automated scanning) | Clean (Apache 2.0/MIT) |
+| **AI Testbed/Sandbox** | ClearML Sessions (compute isolation) + Deepchecks (validation gates) | HAIME (clinical review), Kaapana (JupyterLab) | AGPL/SSPL concerns |
+| **Dashboard & Clinician UX** | OHIF Viewer (imaging) + Grafana (monitoring) | mercure web UI, MLflow UI | Clean (MIT/Apache 2.0) |
+| **Governance & Compliance** | FUTURE-AI framework (principles) + MLflow (lineage) + DVC (audit trail) | Great Expectations (data quality), AIDE (NHS reference) | Clean |
+| **Federated Learning** | NVIDIA FLARE | OpenFL | Clean (Apache 2.0) |
+
+---
+
+## Five strategic takeaways for platform development
+
+**First, MONAI Deploy should be your foundation layer.** It is the only production-grade, Apache 2.0 platform purpose-built for deploying medical AI in clinical environments, with native DICOM/FHIR integration and an industry-standard model packaging format (MAPs). Its backing by NVIDIA, Siemens, and major academic medical centers ensures long-term viability.
+
+**Second, the monitoring stack requires assembling multiple tools.** Evidently AI provides the broadest single-tool coverage for PIE/PMS, but must be supplemented with NannyML (for the critical capability of estimating performance without ground truth), AIF360 or Fairlearn (for bias auditing), and SHAP (for explainability). No single tool covers the full FUTURE-AI framework.
+
+**Third, license traps exist in otherwise excellent projects.** Seldon Core (BSL 1.1, $18K/year), Alibi Detect (BSL), Deepchecks monitoring (AGPL), ClearML server (SSPL), and Kaapana (AGPL) all have licensing that may conflict with hospital deployment requirements. Evaluate these carefully before adoption — Apache 2.0 and MIT-licensed alternatives exist for every capability.
+
+**Fourth, FHIR/OMOP integration remains the weakest link in the open-source ecosystem.** While DICOM is well-served by MONAI Deploy, mercure, and Orthanc, the **FHIR and OMOP integration layer** is comparatively immature. HealthChain is the most promising emerging tool for FHIR/CDS Hooks, and OHDSI's PatientLevelPrediction handles OMOP, but a unified multi-standard integration layer will likely require custom development.
+
+**Fifth, Kaapana serves as the best available reference architecture** even if its AGPL license prevents direct adoption. Its deployment at 36 German university hospitals validates both the technical architecture (dcm4chee + Airflow + Keycloak + Grafana + OHIF) and the operational model. Studying its design decisions — particularly around workflow orchestration, access control, and federated learning — will accelerate your platform development significantly.

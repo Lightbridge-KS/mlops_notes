@@ -21,6 +21,12 @@ book:
           href: "contents/monai/monai_map.qmd"
         - text: "MAP Example"
           href: "contents/monai/nonai_map_example.qmd"
+    - part: Landscape & Protocols
+      chapters: 
+        - text: "OSS Landscape for AI Orchestraction"
+          href: "contents/deep-research/OSS_Landscape_BuildingBlock_DeepResearch.qmd"
+        - text: "PL for Non-LLM models"
+          href: "contents/deep-research/RadAI_Published_Languages_Report.qmd"
 
 format:
   html:

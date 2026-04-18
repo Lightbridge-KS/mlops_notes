@@ -1,0 +1,546 @@
+---
+title: "Published Languages for Non-LLM Radiology AI Inference: A DDD-Framed Landscape Report"
+---
+
+## 1. Executive summary
+
+**The single most important architectural finding of this research is that there is no unified Published Language for radiology AI inference — the stack is sharded into four layers with radically different maturity levels, and the middle two layers are the most fragile.** The prior report mapped the OpenAI Chat Completions API as an *Emergent* Published Language (PL) for LLM inference. For non-LLM radiology deep learning the picture is very different: at the **transport** layer, **KServe Open Inference Protocol v2 (OIP)** is a credible *Designed* PL inside the ML bounded context, while **DICOMweb + IHE AIW-I/AIR** is the *Designed* PL at the clinical boundary; at the **domain output** layer, **DICOM SEG + DICOM SR TID 1500 + FHIR DiagnosticReport/Observation** constitute the strongest stack in the entire landscape. But between them, at the **model packaging** and **task-level I/O semantics** layers, the PL story collapses into framework-local conventions and ad-hoc vendor dialects. Ramathibodi's platform must own a canonical internal representation and place two distinct Anti-Corruption Layers (ACLs) — inbound (against vendor dialects) and outbound (toward DICOM/FHIR).
+
+**Hypothesis confirmed with nuance.** Axis 3 (task-level I/O semantics) is the weakest PL layer in the stack for classification, 2D/3D detection, landmarks, and regression, where designed cross-vendor PLs are effectively absent. Segmentation is an exception: DICOM SEG provides a designed PL at the clinical boundary, and the SAM-family prompting schema is emerging as an unusual *code-level* PL across MedSAM, SAM 2, MedSAM2, MONAI VISTA-3D, SegVol, SAM-Med3D, and ScribblePrompt — the segmentation equivalent of "everyone copies the Chat Completions shape," one layer lower in the stack.
+
+**Commercial reality is bracing.** Aidoc, Qure.ai, Annalise.ai, Lunit, Viz.ai and peer CT-triage vendors overwhelmingly emit DICOM Secondary Capture (burned-in overlay) plus proprietary HL7 ORU^R01 for worklist prioritization; DICOM SR is a minority output; DICOM SEG and Parametric Map are rare; native FHIR is essentially nonexistent. Orchestrator peers (Blackford, Ferrum, Incepto, deepcOS, Siemens syngo.via, Nuance PIN) are mostly passthrough routers — none publishes a canonical normalization of third-party vendor outputs to DICOM SR TID 1500 + DICOM SEG + FHIR. **That canonical representation is the architectural seam where Ramathibodi's platform adds value, not a duplication of commercial capability.**
+
+**Thailand-specific constraints** add three hard edges: (1) Thai FDA's locked-model posture is stricter than FDA PCCP — packaging PLs must support immutable versioning and explicit change-notification cycles; (2) human-in-the-loop is a mandated constraint, so the PL must carry radiologist verification state; (3) HOSxP/HOSxP XE runs in 800+ public hospitals, forcing HL7 v2 fall-back alongside any FHIR aspiration.
+
+**Five recommendations** guide both Ramathibodi and the Thailand Medical AI Consortium: adopt OIP as the internal transport PL with a DICOMweb ACL; treat MONAI Bundle inside a MAP/OCI envelope as the packaging default; codify an internal canonical JSON representation explicitly shaped to round-trip into DICOM SR TID 1500 + DICOM SEG + FHIR Observation; publish a Thai AI-SaMD Integration Profile aligning SIL-TH FHIR IGs with IHE AIR 1.3 and FUTURE-AI; and make explainability and uncertainty first-class extensions, filling the two clearest global PL gaps.
+
+---
+
+## 2. DDD framing: OHS, PL, and ACL applied to AI inference
+
+Domain-Driven Design distinguishes **bounded contexts** (coherent models with their own vocabulary) and the integration patterns that connect them. Three patterns matter here:
+
+An **Open Host Service (OHS)** is a protocol a bounded context exposes so that many downstream consumers can integrate without custom per-consumer translators. A **Published Language (PL)** is the documented interchange vocabulary spoken across that boundary. An **Anti-Corruption Layer (ACL)** is the translation tier that insulates one context from another context's model. Eric Evans further distinguished **Designed PLs** — intentionally governed, versioned, community-authored (DICOM, HL7 FHIR, ONNX) — from **Emergent PLs** — de facto conventions that crystallize from dominant tooling (Hugging Face pipeline shapes, OpenAI Chat Completions, the COCO JSON schema, SAM's prompt encoder).
+
+Mapped onto radiology AI, four bounded contexts recur. The **data-science context** speaks tensors, PyTorch state_dicts, and Hugging Face pipelines. The **inference-serving context** speaks OIP v2 / Triton / TorchServe. The **radiology workflow context** speaks DICOM, DICOMweb, and IHE profiles. The **clinical care context** speaks FHIR, HL7 v2, SNOMED CT, and LOINC. Each context has its own PL with its own governance; the architectural question is where to put the ACL and what the canonical internal model should look like.
+
+The critical DDD insight is that **packaging and task-level I/O semantics are the two layers where no dominant PL has emerged** — they sit between the ML context and the clinical context and force every orchestration platform to build bespoke translators. The rest of this report makes that claim concrete.
+
+---
+
+## 3. Axis 1 — Transport / Serving Protocol
+
+### The ML-industry PL: Open Inference Protocol v2
+
+The **Open Inference Protocol (OIP)**, also known as KServe V2, is the most mature Designed PL in the non-LLM ML serving space. Originating as KFServing V2 inside Kubeflow, donated to LF AI & Data in February 2022, and accepted as a **CNCF Incubating project on 29 September 2025**, OIP publishes a pair of artifacts — an OpenAPI 3.0 spec (`open_inference_rest.yaml`) and a Protobuf service (`inference.GRPCInferenceService`) — under Apache 2.0, with SemVer versioning. The wire contract is `POST /v2/models/{model}/versions/{version}/infer` with a JSON body of named tensors carrying `shape`, `datatype`, and `data`, plus a gRPC raw-tensor path for FP16/BF16 where JSON cannot cleanly represent the dtype.
+
+**Endorsement is broad but conformance is honor-system.** NVIDIA Triton, KServe itself, Seldon MLServer, Seldon Core v2, OpenVINO Model Server, AMD Inference Server, and TorchServe all claim OIP compatibility; TensorFlow Serving is sometimes listed as an endorser but its V1 `/v1/models/{m}:predict` path remains dominant in practice. Conformance tests are not published; the `parameters` extension map is routinely abused for non-portable fields (Triton's `binary_data`, `classification`, `sequence_id` additions are the canonical examples). **Confidence: high** on OIP's designed-PL status; **medium** on the degree of real cross-server portability — a sophisticated client that avoids extensions can move between Triton and MLServer, but a naive one cannot.
+
+BentoML and Ray Serve are **not PLs**: they are SDK frameworks that generate bespoke per-service APIs. Hugging Face TGI's OpenAI-compatible API is an Emergent PL for LLMs but off-scope for classical non-LLM radiology inference.
+
+### The clinical-boundary PL: DICOMweb + IHE
+
+At the clinical network boundary, **DICOMweb** (QIDO-RS for query, WADO-RS for retrieve, STOW-RS for store, UPS-RS for workflow) is an uncontested Designed PL governed by NEMA/MITA, universally implemented across Orthanc, dcm4chee, Google Cloud Healthcare API, Azure Health Data Services, AWS HealthImaging, and effectively every modern on-prem PACS. **IHE AIW-I** (AI Workflow for Imaging, Rev 1.3 draft 2025-08-08) layers on top, using DICOM UPS-RS to orchestrate Task Requestor → Task Manager → Task Performer interactions in push, pull, and triggered-pull modes. **AIW-I does not specify the model-inference wire protocol**; it governs workflow. **IHE AIR** (AI Results, Rev 1.3 2025-08-08) standardizes what comes back — DICOM SEG, RT-STRUCT, SR (TID 1500), Parametric Map — and is a result-encoding PL rather than a transport.
+
+DICOMweb and OIP are **complementary, not competing**. A typical production pattern is DICOMweb → ACL (gateway) → OIP → ACL → DICOMweb. The gateway is where the Published Language translation happens and is the single largest source of radiology-AI bugs (orientation flips, spacing mismatches, VOI-LUT misapplication). MONAI Deploy Informatics Gateway (MIG), Google's `healthcare-dicom-dicomweb-adapter`, and Alvearie imaging-ingestion are reference open-source implementations of this ACL pattern.
+
+### Comparison
+
+| Protocol | Governance | License | DDD class | Healthcare adoption | Streaming |
+|---|---|---|---|---|---|
+| **OIP / KServe V2** | KServe / CNCF Incubating (Sep 2025) | Apache 2.0 | **Designed PL** | Indirect via MONAI/Triton; no hospital list | Not normative; added ad hoc in v0.13 (2024) |
+| **NVIDIA Triton** | NVIDIA (BSD-3) | BSD-3 | **Designed PL** (OIP+extensions) | MONAI Deploy, Clara, Siemens AI-Rad Companion | gRPC bidi; decoupled backends |
+| **Seldon MLServer / Core v2** | Seldon (BSL 1.1 / Apache 2.0) | Mixed | **Designed PL** (OIP-conformant) | Limited named healthcare | Kafka pipelines |
+| **TorchServe** | PyTorch Foundation / LF | Apache 2.0 | **Emergent PL** | Used via SageMaker | HTTP chunked |
+| **TensorFlow Serving** | Google | Apache 2.0 | **Emergent PL** (V1 native) | Google Health legacy | gRPC streaming |
+| **BentoML, Ray Serve** | Vendor/OSS | Apache 2.0 | **Not a PL** — SDK | Research only | Custom per-service |
+| **DICOMweb** | NEMA / DICOM WG-27 | Free | **Designed PL** | Universal | Chunked HTTP; UPS-RS events |
+| **IHE AIW-I** | IHE Radiology TC | Free | **Designed PL** (workflow) | Connectathon-tested; vendor commitment thin | UPS state machine |
+| **IHE AIR 1.3** | IHE Radiology TC | Free | **Designed PL** (result encoding) | Plugathon (VISUS, IAIP partners) | N/A |
+| **MONAI Deploy Gateway** | Project MONAI | Apache 2.0 | **ACL**, not PL | KCL, MIDRC, ACR DSI demo | Event-driven |
+
+Streaming and async remain **underdeveloped for non-LLM**: OIP does not normatively define streaming; Triton's gRPC bidi is the closest portable option; AWS SageMaker Async Inference Endpoints is AWS-specific but pragmatic for long-running radiology work; IHE AIW-I's UPS state machine is the most robust Designed async PL but sits above OIP.
+
+### Verdict
+
+**OIP is the dominant emerging Designed PL for non-LLM ML transport, but it does not reach the clinical network.** DICOMweb and IHE AIW-I/AIR dominate the clinical boundary. The ACL between them is where every serious deployment builds custom code. Fragmentation of OIP dialects (Triton vs MLServer extensions) is significant but tractable; fragmentation between OIP and DICOMweb is the architecturally important seam.
+
+---
+
+## 4. Axis 2 — Model Packaging
+
+No single Published Language dominates model packaging. The landscape splits along bounded-context lines, and each format solves a different subset of the packaging problem.
+
+**ONNX (LF AI & Data, Apache 2.0)** is a Designed PL for the computational graph but has a narrow scope. It captures tensor-in/tensor-out operations via ~200 standardized operators with opset versioning, but it cannot express DICOM-specific preprocessing (rescale slope/intercept, windowing, voxel-spacing resampling, orientation normalization, HU clipping), custom 3D ops, or sliding-window inference without breaking portability via contrib domains. Its `metadata_props` slot is a key/value map with no intended-use, training-provenance, or performance-claim fields. **ONNX is ubiquitous as interchange and universally inadequate as a radiology PL on its own.**
+
+**MLflow Model format (LF AI & Data, Apache 2.0)** is a Python-centric wrapper with "flavors" for sklearn/pytorch/tensorflow/onnx/transformers. Its model signature gives the best off-the-shelf substrate for FDA PCCP version-transition metadata (stage transitions: None/Staging/Production/Archived), but it is a PL for the data-science lifecycle — not for crossing into a radiology deployment context.
+
+**MONAI Bundle (Project MONAI, Apache 2.0)** is the strongest Designed PL for radiology semantic packaging. A bundle directory combines `configs/metadata.json` + `configs/inference.json` where the ConfigParser declaratively instantiates MONAI `Compose([...])` transforms — `LoadImaged`, `Orientationd`, `Spacingd`, `ScaleIntensityRanged`, `CropForegroundd`, `SlidingWindowInferer`. This is the only format in the landscape that provides a **machine-executable preprocessing contract for medical imaging**. Metadata includes `network_data_format` with semantic tensor types (`magnitude`, `hounsfield`, `kspace`, `segmentation`). Governance is NVIDIA-led; adoption beyond NVIDIA includes the MONAI Model Zoo, the open-source mercure DICOM orchestrator, Siemens Healthineers Digital Marketplace, Mayo Clinic Florida, DKFZ, and MSK — but **no evidence that GE, Philips, Canon, Fujifilm, Sectra, Agfa, or Intelerad accept MONAI Bundle as a first-class shipping format** (confidence: medium-high on this negative).
+
+**MONAI Application Package (MAP)** is an OCI-compliant container that wraps a bundle plus DICOM-aware operators (DICOM series selectors, resamplers, SEG/SR writers). Per the official docs, "A MAP uses a bundle as the inference object." Deployed in mercure, Siemens Digital Marketplace, and the AI Centre for Value Based Healthcare (UK). MAP is a Designed PL for the deployment context and a practical cross-vendor candidate because it rides on OCI.
+
+**KitOps ModelKit and CNCF ModelPack** (CNCF Sandbox since May and June 2025 respectively; Apache 2.0) are vendor-neutral OCI-artifact conventions bundling weights, datasets, code, configs, and docs as deduplicated OCI layers. They provide **best-in-class supply-chain integrity** (SHA-256 digests, Cosign keyless signing, Rekor transparency log, SLSA attestations, SBOM attachment) and are the strongest candidate for FDA PCCP version-transition metadata when combined with a MONAI Bundle and a Model Card. Radiology adoption as of April 2026 is minimal — confirmed no named radiology vendor or hospital deployment.
+
+**Hugging Face Hub conventions** are an Emergent PL controlled by a single for-profit entity. The Model Card YAML front-matter schema (`license`, `datasets`, `metrics`, `base_model`, `pipeline_tag`, `library_name`, `model-index`) is the de facto public metadata schema of the open-model ecosystem, but HF is not used in production clinical loads.
+
+**Model Cards** (Google Model Card Toolkit JSON schema v0.0.2 and HF YAML front-matter) are the richest human-readable metadata format in the landscape. They map well to EU AI Act Annex IV §2(a), (b), (g) and to FDA PCCP "Description of Modifications" but are not machine-readable enough alone to substitute for a technical file.
+
+**DICOM does not currently define a packaging standard for AI model weights.** Supplements 205/208 encapsulate STL/OBJ 3D models, Supplement 219 is the JSON representation of SR (for AI *output* encoding), but no AI-Model IOD exists. A DICOM "Encapsulated Model" supplement has been discussed in community forums but not drafted.
+
+### Regulatory alignment
+
+**IEC 62304** favors OCI-based artifacts with layered SBOMs because SHA-256 digests plus layer inventory create a directly defensible configuration item. **FDA PCCP (December 2024 final guidance, August 2025 trilateral FDA/Health Canada/MHRA principles)** is best supported by the synthesized stack of **ModelPack/ModelKit + Sigstore + MONAI Bundle + Model Card**. **EU AI Act Annex IV** cannot be satisfied by any single packaging format; MDCG 2025-6 explicitly permits manufacturers to reference Annex IV info from existing MDR technical documentation, meaning the packaging format is expected to *reference* the Annex IV dossier rather than contain it.
+
+### Comparison
+
+| Format | Governance | Preprocessing contract | Metadata richness | Signing | Radiology adoption | DDD class |
+|---|---|---|---|---|---|---|
+| ONNX | LF AI & Data | None (tensor-level) | Very low | External (Sigstore) | Ubiquitous interchange | Designed PL — graph scope |
+| MLflow | LF AI & Data (Databricks-led) | Signature, no DICOM | Moderate | External | Data-science teams; rare on PACS | Designed PL — ML-lifecycle |
+| **MONAI Bundle** | Project MONAI | **Strong (declarative MONAI transforms)** | **High (domain-rich)** | External | MONAI Zoo + mercure + Siemens Mktplc + Mayo + DKFZ | **Designed PL — community** |
+| MONAI MAP | Project MONAI | Operator DAG | Moderate-high | Cosign on OCI | mercure, Siemens, AI Centre VBH | Designed PL — emerging |
+| **KitOps / ModelPack** | CNCF Sandbox | Out-of-band | Moderate | **Best-in-class (Cosign+Rekor+SLSA+SBOM)** | Minimal in radiology | Designed PL — general |
+| Hugging Face Hub | HF Inc. (private) | Library-dependent | Moderate (YAML front-matter) | Emerging | Research only | Emergent PL — vendor-controlled |
+| Model Cards (Google MCT / HF) | Google / HF | N/A | Highest (human) | None native | Informal | Emergent PL — converging |
+| DICOM supplements | NEMA / WG-23 | N/A | N/A for models | PS3.15 signatures | Universal for I/O | Designed PL — sibling context |
+
+### Verdict
+
+**The defensible 2026 packaging stack is OCI image (MAP or ModelPack) → embedding a MONAI Bundle → whose weights are ONNX → documented as a Google-MCT-schema Model Card → signed with Sigstore keyless OIDC → logged in Rekor → with SLSA Level 2+ provenance.** No single item is sufficient; the stack requires significant ACL glue — and that glue is exactly what every commercial radiology vendor currently reimplements in-house.
+
+---
+
+## 5. Axis 3 — Task-level I/O semantics (the weakest axis)
+
+The original hypothesis — that task-level I/O semantics is the most fragmented layer in the radiology AI stack — is **confirmed for classification, 2D/3D detection, landmarks, and regression**, and **partially refuted for segmentation**, where DICOM SEG provides a clinical-boundary Designed PL and the SAM-family prompting schema has become a remarkable code-level Emergent PL.
+
+### Classification
+
+Framework-local output shapes dominate. **TorchVision** returns raw logits `Tensor[B, C]` with no activation applied. **Hugging Face `pipeline("image-classification")`** returns `[{label, score}, ...]` top-k, applying softmax if multi-class and sigmoid only when `num_labels == 1` — a silent **radiology footgun** for 14-label CheXpert heads loaded without explicit `problem_type="multi_label_classification"`. **MMClassification** emits `pred_score`/`pred_label`/`pred_class`. **MONAI's ClassificationSaver** writes raw prediction tensor rows to CSV with no enforced activation. **Detectron2** exposes only max-prob scores per instance. No cross-vendor convention exists for rejection/abstention, and **uncertainty is not communicated at inference by any framework** — no library emits calibration temperature, predictive entropy, or epistemic/aleatoric decomposition in a named field. Radiology-specific label sets (CheXpert 14, PadChest ~174, BI-RADS 0–6) are carried positionally, not semantically; the ternary training labels {positive, negative, uncertain} of CheXpert are lost at inference. **Verdict: Framework-local PL, no cross-vendor PL.**
+
+### Segmentation — two stories
+
+**Classical segmentation has no unified PL.** Label-map tensors vs one-hot vs per-class probabilities; NIfTI vs NRRD vs DICOM SEG vs COCO RLE vs palette PNGs; nnU-Net requires consecutive integer labels and strips uncertainty unless `--save_npz` is passed; MONAI produces `SlidingWindowInferer` logits and expects user-composed `AsDiscrete`/`KeepLargestConnectedComponent`; MMSegmentation emits `SegDataSample.pred_sem_seg`; TorchVision emits `OrderedDict{'out': logits}`. Container formats are emergent (NIfTI + sidecar JSON for class names, nnU-Net-centric) or designed (DICOM SEG, the only clinical PL). Round-tripping a bare integer label-map to DICOM SEG is lossy because integer IDs carry no semantics and require an external mapping to SNOMED/DCM codes.
+
+**Promptable segmentation has produced, in ~24 months, a code-level Emergent PL.** The schema established by SAM (Kirillov et al., ICCV 2023) is remarkably uniform across derivatives:
+
+```
+Inputs:  image (cached embedding)
+         point_coords: [B, N, 2|3]
+         point_labels: [B, N] ∈ {0, 1}   (0=negative, 1=positive)
+         boxes:        [B, 4|6]          (xyxy or xyxyzz)
+         mask_input:   [B, 1, 256, 256]  (previous low-res logits)
+Outputs: masks:           [B, 3|1, H, W|D]
+         iou_predictions: [B, 3|1]
+         low_res_logits:  [B, 3|1, 256, 256]  (feedback for refinement)
+```
+
+**MedSAM** (Ma et al., *Nature Communications* 2024, 15:654) fine-tunes on 1.57M medical pairs and preserves the schema verbatim; released weights load into unmodified SAM code. **SAM 2** (Ravi et al. 2024) adds a streaming memory bank for video/volumes; prompts remain compatible. **MedSAM2** (bowang-lab, 2025) extends to 3D with box-on-RECIST-slice + memory propagation. **MONAI VISTA-3D** (NVIDIA/CVPR 2025) explicitly cites `segment-anything/modeling/prompt_encoder.py` and extends the label alphabet `{-1, 0, 1, 2, 3}` and adds a `label_prompt` channel. **SegVol, SAM-Med3D, MedLSAM, ScribblePrompt, nnInteractive** all preserve the core sparse-prompt-plus-dense-mask vocabulary.
+
+**This is an Emergent PL, narrow spec, strong diffusion.** It is *not* a fully Designed PL — there is no spec document, no versioned JSON schema, no HTTP contract, and 2D/3D dimensionality and prompt-subset conventions diverge (MedSAM is box-only in practice, VISTA adds class prompts, SAM-Med3D drops text). But the degree of code-level reuse across ~10 major models is strong enough to treat it as the segmentation analogue of the SAM-copy-the-Chat-Completions-shape phenomenon — one layer lower in the stack, at tensors rather than HTTP.
+
+### Object / lesion detection
+
+**2D detection has ≥3 box formats × 3 coordinate scales.** Hugging Face uses `{score, label, box:{xmin,ymin,xmax,ymax}}` (xyxy-dict); Detectron2 uses XYXY_ABS `Tensor[N,4]`; MMDetection v3 uses `DetDataSample.pred_instances.bboxes` (xyxy); Ultralytics YOLO exposes `.xyxy`, `.xywh` (center+wh), `.xyxyn`, `.xywhn`; COCO's results JSON uses `[x, y, w, h]` top-left; DETR-internal is cxcywh-normalized. **COCO format is a training/evaluation PL, not an inference PL** — no production radiology deployment target consumes COCO JSON as its contract. **3D detection is catastrophically fragmented**: axis order (ZYX vs XYZ), coordinate frame (LPS vs RAS), and units (voxel vs mm) are all ambiguous without explicit declaration, and no framework emits the `FrameOfReferenceUID` alongside the box tensor. **Verdict: Framework-local for 2D; no PL for 3D.**
+
+### Landmarks
+
+COCO-17 person pose is an Emergent PL only because the order itself is the semantics. **Medical landmark detection has no PL.** Cephalometric datasets use 10, 13, 19, 29, or 68 points depending on cohort; cardiac landmarks are per-lab; spine vertebral-body corners have no unified index. Every radiology landmark model ships its own schema, usually documented only in a README.
+
+### Regression / scoring
+
+No framework emits calibration metadata, confidence intervals, or calibrated uncertainty. Reference-range semantics are radically ambiguous: a scalar output can be a clinical value in physical units (EF 0.55, bone age in months, Agatston AU), a normalized probability in [0,1], a z-score, a Lung-RADS-like discretization, or an unscaled logit. Agatston score is a domain-level Designed PL (Agatston 1990) but the inference-output encoding is not standardized. **Verdict: no PL at framework layer; clinical definitions (Agatston, EF, BI-RADS) Designed at domain layer.**
+
+### Image-conditioned structured finding generation (non-LLM)
+
+DICOM SR CAD templates (**TID 4100 Chest CAD, TID 4300 Mammography CAD, TID 4120, TID 4129 Colon CAD**) are a Designed PL for structured-finding generation and have been normative since the early 2000s. IHE AIR 1.3 builds on TID 1500. But adoption in open-source inference stacks is minimal — CheXpert-style bare tensor outputs dominate research, and vendors bolt on SR conversion as a post-processing step.
+
+### Cross-cutting
+
+The Hugging Face pipeline task-output family (`[{label, score}]`, `[{mask, label, score}]`, `[{score, label, box:{xmin,...}}]`) is a coherent library-local Emergent mini-PL and the closest thing to a shared task-level contract in the open-source world. **Triton, KServe, and TorchServe deliberately do not standardize task semantics** — they stop at the tensor layer. Uncertainty, calibration, and provenance are uniformly absent from the inference contract across every task and framework.
+
+### ASCII: fragmentation map
+
+```
+Task           Designed PL          Emergent PL                 Reality
+───────────────────────────────────────────────────────────────────────
+Classification  —                   HF [{label,score}]          Framework-local
+Segmentation   DICOM SEG            SAM prompt/mask schema      Split designed/emergent
+Detection 2D    —                   HF box-dict, YOLO           Framework-local (xyxy/xywh/cxcywh)
+Detection 3D    —                   —                           NO PL
+Landmarks       —                   COCO-17 (persons only)      Medical: NO PL
+Regression      clinical-definition —                           NO encoding PL
+Struct finding  DICOM SR CAD TIDs   —                           Designed but unused
+Uncertainty     —                   —                           GAP
+Explainability  —                   —                           GAP
+```
+
+### Verdict
+
+**Axis 3 is the weakest Published Language layer in the radiology AI stack**, with the qualifier that segmentation is an outlier because of DICOM SEG and the SAM-family emergent PL. For every other task, the layer is fragmented across multiple framework-local conventions, with uncertainty and provenance absent by default. This is the single biggest architectural lever an orchestration platform has — choose an opinionated internal canonical representation here and every downstream concern becomes easier.
+
+---
+
+## 6. Axis 4 — Domain-level output (healthcare)
+
+Axis 4 is where the strongest Published Languages live.
+
+### DICOM AI output standards
+
+**DICOM Segmentation (Supplement 111, normative since 2008)** encodes binary or fractional masks with per-segment SNOMED/DCM codes. Supported natively by OHIF, 3D Slicer, Cornerstone3D, and the major PACS viewers (Sectra IDS7, Visage 7, Intelerad, Philips IntelliSpace). Canonical tooling is **dcmqi, pydicom, highdicom (Bridge et al., *J Digit Imaging* 2022), and DCMTK**. Known limits: large 3D fractional volumes are unwieldy; SEG immutability forces new-SEG-supersedes for radiologist corrections; geometry mismatches on resampled volumes plague vendor emitters.
+
+**DICOM RT Structure Set** is the canonical example of emergent PL overwhelming designed PL. Because every RT planning system and every modern PACS has mature RT-Struct rendering, radiology AI vendors shipped RT-Struct *despite it being out-of-domain*. DICOM WG-23 and IHE AIR explicitly allow either SEG or RT-Struct. SEG adoption is closing the gap in 2024–2025.
+
+**DICOM Parametric Map (Supplement 172)** is the correct container for heatmaps, probability volumes, and Grad-CAM-style saliency, with `RealWorldValueMappingSequence` for units and semantics. **Adoption is modest**; most PACS render it only as a pseudo-color overlay.
+
+**DICOM Structured Report** templates are the structured-finding PL. **TID 1500 Measurement Report** is the dominant modern pattern, with **TID 1411 Volumetric ROI** and **TID 1410 Planar ROI** as children. **TID 4100/4300/4120/4129** are the legacy CAD templates; mammography workstations still prefer TID 4300 for display, so AI mammo vendors emit it for backward compatibility.
+
+**DICOM Supplement 219 — JSON Representation of DICOM SR** (trial implementation, frozen ver 14) is the single most important recent supplement for AI output, creating PS3.22 so ML engineers unfamiliar with DICOM can author TID 1500-compatible results in JSON with automatic binary-SR serialization. This explicitly narrows the cultural gap between data-science JSON and DICOM SR.
+
+**DICOM Secondary Capture (Sup 104 Encapsulated PDF and plain SC images)** is the semantically empty but universally ingestible fallback — the lingua franca vendors actually ship when they don't want to implement SEG or SR.
+
+### FHIR for AI outputs
+
+Core resources: **DiagnosticReport** (report), **Observation** (discrete finding, bound to LOINC / RadElement CDE / SNOMED), **ImagingStudy** (DICOM UID pointers), **RiskAssessment** (prediction probabilities), **Device + DeviceDefinition** (model identification with UDI), **Provenance** (AI-agent-and-entity traceability), **AuditEvent** (security audit).
+
+The **HL7 AI Transparency on FHIR Implementation Guide** (ballot v1.0.0 in 2025, FHIR R4) introduces element-level security tags `AIAST` (Artificial Intelligence Asserted) and `DICTAST` (Dictation Asserted), an inline security-label extension, and Provenance profiles for AI-Authored-Element and AI-Generated-Lab-Results. This is the canonical FHIR-layer PL for AI provenance but is still **pre-normative**.
+
+Regulatory pressure is pushing FHIR adoption. The **ONC HTI-1 Final Rule** (effective Feb 2024; DSI criterion enforcement 1 Jan 2025) requires certified Health IT modules to expose **31 source attributes** for Predictive Decision Support Interventions — effectively mandatory model cards at the EHR boundary. The **EU AI Act Article 50** transparency obligations apply from August 2026, overlapping with MDR for AI medical devices.
+
+**There is no published FHIR Imaging-AI IG.** The FHIR-side PL is assembled ad hoc from DiagnosticReport + Observation + RadElement CDE + AI Transparency security labels + Device.
+
+### IHE profiles and PACS vendor reality
+
+**AIW-I (AI Workflow for Imaging)** at Trial Implementation uses DICOM UPS-RS for orchestration. **AIR (AI Results) Rev 1.3 (2025-08-08)** mandates Comprehensive 3D SR, allows SEG/RT-Struct/Parametric Map/SR/Presentation States, and is explicitly silent on TID 1500 vs CAD templates (an acknowledged non-decision). **AIRA / AIRAI (2025-06-12)** from IHE Europe covers the verification workflow — accept/reject/adjust status of AI findings — using DICOM `VerificationFlag (0040,A493)`. Trial tested at Vienna Plugathon June 2025.
+
+**No PACS vendor currently publishes a formal AIR/AIW-I Integration Statement comparable to their SWF or XDS-I statements.** Plugathon and Connectathon participation is real — VISUS/JiveX is the most publicly committed, and the RSNA Imaging AI in Practice demonstrations include Agfa, Change Healthcare/Nuance, GE HealthCare, Philips IntelliSpace, Sectra, Siemens Healthineers syngo/AI-Rad Companion, and Visage — but this is **testing-grade conformance, not contract-grade**. Confidence: medium on specific vendor claims.
+
+### Vocabulary binding
+
+- **Inside DICOM SR/SEG/PM**: DCM + SNOMED CT + RadLex dominate, anchored by PS3.16 Content Mapping.
+- **Inside FHIR at the EHR boundary**: LOINC (report/procedure identity) + SNOMED CT (findings/interpretations) + **RadElement CDE (structured radiology AI observations, fastest-growing).**
+- SNOMED CT is the single most-used vocabulary across both sides.
+
+### Explainability — the clearest PL gap
+
+**There is no normative standard for saliency maps, Grad-CAM, attention maps, or integrated-gradient outputs as clinical artifacts.** DICOM Parametric Map is the correct container in principle; DICOM Secondary Capture is the low-end rasterized fallback; fractional DICOM SEG is a viable hack. But no TID distinguishes "Grad-CAM attribution" from "probability" from "raw model logit"; no IHE profile references explainability; no FHIR resource distinguishes an explanation artifact. **This is the single largest Designed-PL gap in the radiology AI output layer.** Every vendor ships explainability as a private overlay, burned-in annotation on Secondary Capture, or out-of-band PNG. Cross-vendor saliency audit is effectively impossible.
+
+### Uncertainty — containers without conventions
+
+DCM code **111012 "Certainty of Finding"** exists and is used in CAD SR templates. Numeric probabilities can be embedded as TID 1419 measurement items. FHIR offers `Observation.interpretation` (HL7 v3 coded: high/low/abnormal), `Observation.referenceRange`, and **`RiskAssessment.prediction.probabilityDecimal` / `probabilityRange`**. **FUTURE-AI (BMJ 2025, Lekadir et al., doi:10.1136/bmj-2024-081554)** Uncertainty/Robustness principle recommends calibrated uncertainty but does not prescribe encoding. The containers exist; conventions do not. Calibration (Brier, reliability-curve parameters, temperature) is entirely unspecified. AIR 1.3 Q&A explicitly flags this — DCM has 111012, FHIR has 3-degree SNOMED severity, DICOM CID 3716 has 7 degrees, no harmonization.
+
+### Verdict
+
+**The strongest Published Language at the radiology-AI output boundary is DICOM SEG + DICOM SR TID 1500 + ReferencedSeriesSequence, bound to SNOMED/RadLex/DCM, transported over DICOMweb, profiled by IHE AIR 1.3.** The FHIR stack is the strongest PL at the EHR-facing boundary but lags in AI-specific extensions, EHR implementation of Provenance, and terminology consistency. Explainability and uncertainty are the two principal gaps.
+
+---
+
+## 7. Task × Layer Published Language matrix
+
+Each cell summarizes the recommended PL, its maturity, and the DDD class. **D = Designed, E = Emergent, F = Framework-local, — = Gap.**
+
+| Task | Transport (Axis 1) | Packaging (Axis 2) | Task I/O (Axis 3) | Domain Output (Axis 4) |
+|---|---|---|---|---|
+| **Classification** | OIP v2 (D, emerging); DICOMweb + IHE AIW-I (D, clinical) | MONAI Bundle / ONNX (D for graph; no DICOM preproc) | HF `[{label, score}]` (F); no multi-label convention | DICOM SR TID 1500 + FHIR Observation + RadElement CDE (D, strongest) |
+| **Segmentation** | OIP v2 (D); DICOMweb/AIW-I (D) | **MONAI Bundle (D-community, strongest)**; MAP for deployment | Label-map NIfTI (E, nnU-Net); SAM prompt/mask (**E, strong diffusion**); DICOM SEG at clinical edge (D) | **DICOM SEG (D, normative 2008)**; RT-Struct (emergent persistence); Parametric Map for fractional |
+| **Detection (2D)** | OIP v2 (D); DICOMweb | ONNX (D, graph only) | xyxy/xywh/cxcywh fragmentation (F); HF box-dict as emergent mini-PL | DICOM SR TID 1500 + SCOORD / FHIR Observation (D) |
+| **Detection (3D)** | OIP v2 (D); DICOMweb | ONNX with custom 3D ops (partial) | **No PL** — LPS/RAS, axis-order, unit ambiguity | DICOM SR SCOORD3D in `FrameOfReferenceUID` (D, underused) |
+| **Landmark** | OIP v2; DICOMweb | ONNX | COCO-17 for person-only (E); medical: **no PL** | DICOM SR TID 1500 point content items + FHIR Observation.component (D) |
+| **Regression / scoring** | OIP v2 (D); DICOMweb | ONNX; MONAI Bundle | **No PL** — units/uncertainty/reference-range ambiguous | DICOM SR TID 1500 numeric measurements + FHIR Observation.value with UCUM + RiskAssessment (D) |
+| **Report / finding generation (image-conditioned, non-LLM)** | OIP v2; DICOMweb | MONAI Bundle; ONNX | CheXpert-style positional tensor (F); DICOM SR CAD TIDs exist but unused at framework layer | **DICOM SR TID 1500 + TID 4100/4300 legacy (D); Sup 219 JSON-SR is the key enabler**; FHIR DiagnosticReport + RadElement |
+
+### Reading the matrix for decisions
+
+Three patterns are visible. **Axis 4 is consistently strongest** — there is always a Designed PL available, even when underused. **Axis 3 is consistently weakest** — for every task except segmentation, the answer is framework-local or no PL at all. **Axis 2 is MONAI Bundle + ONNX for every imaging task** — the combination is the de facto standard, even though neither alone is sufficient. **Axis 1 is OIP v2 inside the data center, DICOMweb at the clinical boundary, with a mandatory ACL between** — this is non-negotiable.
+
+---
+
+## 8. ACL placement analysis
+
+The central architectural question: **does the platform need one ACL or two?**
+
+```
+External AI Models ──▶ [ACL_in] ──▶ Internal Canonical ──▶ [ACL_out] ──▶ HIS/RIS/PACS/EHR
+                                     Representation
+```
+
+**The answer is two.** A single ACL would force the canonical representation to leak either inbound vendor idiosyncrasies (breaking downstream consumers when a vendor changes format) or outbound DICOM/FHIR constraints (forcing internal code to think in DICOM SR trees and FHIR CodeableConcepts). DDD explicitly warns against this — a well-chosen canonical model is the insulation between the two translation tiers.
+
+### ACL_in — Inbound model normalization
+
+Responsibilities: translate heterogeneous vendor outputs (DICOM SEG, RT-Struct, Secondary Capture with proprietary JSON, HL7 ORU^R01, vendor REST JSON, mobile push events) into the internal canonical shape. Stamp provenance (originating vendor, algorithm version, input series UIDs, ACL-assigned result UID) — because no commercial vendor or orchestrator does this reliably. Resolve tensor I/O ambiguities (axis order, coordinate frame, units). Map vendor label ontologies to canonical codes (SNOMED/DCM/RadElement).
+
+Placement: per-vendor adapter modules, sharing a common interface. This is the same multi-adapter pattern Blackford, Ferrum, Incepto, deepcOS, and Nuance PIN use — the difference is Ramathibodi commits to a standards-rich canonical form on the far side of the ACL.
+
+### ACL_out — Outbound domain translation
+
+Responsibilities: emit DICOM SEG (Supplement 111) for segmentations with SNOMED-coded SegmentedPropertyCategoryCodeSequence; DICOM SR TID 1500 Measurement Report for findings; DICOM Parametric Map for probability volumes and saliency maps; FHIR DiagnosticReport + Observation + Device + Provenance for the EHR boundary. Honor IHE AIR 1.3 workflow for result storage and IHE AIRA 2025 for verification-flag round-trip. Apply RadElement CDE codes to Observation components where available; fall back to SNOMED CT + RadLex + LOINC otherwise.
+
+Placement: single emission tier with pluggable target formats (SEG vs RT-Struct chosen per PACS capability; FHIR R4 vs R4B per EHR target; HL7 v2 ORU for HOSxP compatibility). Use **highdicom** for DICOM SEG/PM/SR generation — it is the canonical Python reference implementation (Bridge et al., 2022).
+
+### Why two ACLs — the DDD argument
+
+A single ACL conflates two orthogonal concerns: insulating against vendor churn (ACL_in) and insulating against clinical-standard evolution (ACL_out). When Aidoc changes its worklist payload format, ACL_in absorbs it — the canonical model doesn't notice. When DICOM Supplement 219 JSON-SR becomes normative or IHE AIRA matures, ACL_out evolves — vendor adapters don't notice. The canonical model stays clean.
+
+```
+   ┌────────────────┐   ┌───────────┐   ┌──────────────────┐   ┌───────────┐   ┌──────────────┐
+   │ Vendor outputs │   │           │   │ Canonical Result │   │           │   │ DICOM SEG/SR │
+   │ • DICOM SC     │──▶│  ACL_in   │──▶│ (internal JSON)  │──▶│  ACL_out  │──▶│ + Param Map  │
+   │ • Vendor HL7   │   │           │   │ • finding_code   │   │           │   │ + FHIR       │
+   │ • Vendor REST  │   │ per-vendor│   │ • evidence       │   │ pluggable │   │ + HL7 v2     │
+   │ • Mobile push  │   │ adapters  │   │ • uncertainty    │   │ emitters  │   │   (HOSxP)    │
+   │ • DICOM SR     │   │           │   │ • provenance     │   │           │   │              │
+   └────────────────┘   └───────────┘   └──────────────────┘   └───────────┘   └──────────────┘
+                              │                                       │
+                              ▼                                       ▼
+                   Vendor version churn                      Standard evolution
+                   absorbed here                             absorbed here
+```
+
+### The Thailand angle
+
+Thai FDA's human-in-the-loop mandate means ACL_out must produce results that default to `Observation.status = preliminary` and transition to `final` only after radiologist verification (captured via IHE AIRA's VerificationFlag). HOSxP's HL7 v2 backbone means ACL_out must also emit ORU^R01 messages with OBX segments mapped from the canonical model. The FHIR path is aspirational but real; the HL7 v2 path is mandatory for public-hospital deployment.
+
+---
+
+## 9. Gap analysis
+
+Ranked by impact on the platform:
+
+**Gap 1 — Explainability artifact standardization (severity: critical).** No TID, no FHIR resource, no IHE profile, no coded identity distinguishes Grad-CAM attribution from probability from raw model logit. DICOM Parametric Map is the container; no convention mandates its use. Clinical consequence: explainability is visually impressive but cannot be quantitatively audited across vendors, retrospectively re-thresholded, or submitted to a quality registry like Assess-AI. **Existing standard extensible:** yes — propose a DICOM WG-23 supplement defining an "Explainability" CID and recommending Parametric Map with a `RealWorldValueMappingSequence` coded to "relative attribution score." **Cost of the gap:** every vendor ships proprietary PNG; cross-study saliency comparison is infeasible.
+
+**Gap 2 — Uncertainty / calibration communication (severity: critical).** Containers exist (DCM 111012, `Observation.interpretation`, `RiskAssessment.probability*`) but no harmonization across them; calibration metadata (temperature, Brier, reliability-curve params) has no standard field in any framework or standard. Clinical consequence: confidence thresholding decisions vary wildly between vendors; regulators (FDA transparency guidance, EU AI Act, FUTURE-AI Uncertainty principle) increasingly demand calibrated outputs that cannot be verified in current data formats. **Existing standard extensible:** yes — propose a DCM CID for calibration metadata (temperature, isotonic bins, predictive-interval coverage) and a FHIR Observation extension for predictive-distribution parameters. **Cost:** without harmonization, any Thai multi-vendor orchestration produces non-comparable confidence scores.
+
+**Gap 3 — Task-level I/O semantics as cross-vendor PL (severity: high).** Verified as the weakest axis. 3D detection is catastrophically fragmented (LPS/RAS, axis-order, unit ambiguity); landmark detection has no medical ordering registry; regression outputs have no unit/reference-range conventions. **Existing standard extensible:** partially — Hugging Face pipeline task shapes could be versioned and formalized, but industry governance is absent. **Cost:** every orchestration platform reinvents tensor-to-DICOM-SR adapters.
+
+**Gap 4 — AI output provenance binding in FHIR (severity: high).** HL7 AI Transparency IG is still ballot-stage; few EHRs implement Provenance robustly; Device.udi linkage is uneven. HTI-1 DSI 31-attribute requirements will force this by 2026 in the US. **Existing standard extensible:** yes, via AI Transparency IG + HTI-1 + FHIRcast. **Cost:** Traceability (FUTURE-AI principle) is unenforceable across the EHR boundary without this.
+
+**Gap 5 — Multi-model orchestration result representation (severity: medium).** When one study has outputs from five AI models, there is no standard aggregate object. AIR 1.3 discusses a "Root Result" concept but defers mandating it. **Existing standard extensible:** yes via DICOM SR Container references or a new AIR profile element. **Cost:** display, governance, and audit across a multi-vendor Ramathibodi deployment are manual.
+
+**Gap 6 — Packaging format for FDA PCCP / Thai FDA locked-model metadata (severity: medium).** No packaging format natively encodes PCCP Description-of-Modifications, Modification Protocol, or Impact Assessment semantics. The synthesis (MAP + MONAI Bundle + ModelPack + Sigstore + Model Card) approximates but is vendor-assembled. **Extensible:** yes via an AI Model Card JSON schema extension. **Cost:** every regulatory submission is bespoke.
+
+**Gap 7 — DICOMweb ↔ OIP ACL pattern (severity: medium).** Every vendor reimplements the informatics-gateway ACL; MIG, Google adapter, Alvearie are open-source references but are not a spec. **Extensible:** via an IHE profile formalizing the gateway actor's transactions. **Cost:** repeated bug surface (orientation flips, VOI-LUT misses).
+
+**Gap 8 — SAM prompting schema formalization (severity: medium, opportunity).** The Emergent PL at the code level begs for formal specification — a versioned JSON schema, an HTTP contract, a conformance suite. CVPR 2025 "Foundation Models for Interactive 3D Biomedical Image Segmentation" challenge is an early formalization signal.
+
+### Hypothesis disposition
+
+- Task-level I/O semantics as cross-vendor PL — **confirmed weak** (except segmentation).
+- Uncertainty / calibration — **confirmed gap**.
+- Explainability artifact standardization — **confirmed gap, largest**.
+- AI output provenance binding in FHIR — **confirmed gap, regulatorily forced**.
+- Multi-model orchestration representation — **confirmed gap, AIR 1.3 defers it**.
+
+### Open questions, not answered definitively
+
+SAM-family foundation models *are* creating a new de facto task PL for segmentation. What remains open is whether it will formalize as a versioned spec (probably yes, within 24 months) and whether 2D and 3D variants will unify (probably not — the dimensionality split is load-bearing). FDA PCCP does implicitly push packaging PLs toward version-transition metadata but no current format fully satisfies; MLflow Model Registry stage transitions and OCI/Sigstore attestations are the closest substrates. MIDRC is unquestionably the most useful academic consortium artifact for the Thai consortium to align with — more so than MI2RL or ACR AI-LAB.
+
+---
+
+## 10. Proposals for the Thailand Medical AI Consortium
+
+### Thailand healthcare AI context (grounding)
+
+Thailand's HIS landscape is dominated by **HOSxP/HOSxP XE** (~800+ public hospitals) and a mix of InterSystems TrakCare, Cerner/Oracle, and Synamed in private chains. PACS is Fujifilm Synapse-heavy with Carestream, Agfa, GE, Siemens, Philips, Sectra, PaxeraHealth all present. FHIR adoption is concentrated in **SIL-TH** (Standards and Interoperability Lab – Thailand, jointly led by Siriraj / Ramathibodi / Chulalongkorn) and the **Health Link** national HIE (400+ hospitals connected, FHIR-based). MOPH's **43/52-file standard** anchors HDC reimbursement, but no national FHIR IG is gazetted.
+
+**Thai FDA (อย.)** published SaMD/AI guidance in June 2024 revised through January 2025. Two constraints matter for architecture: (a) **locked-model posture** — models "should not continuously adapt based on new data during usage"; updates require defined change-notification cycles — stricter than FDA PCCP; (b) **human-in-the-loop is mandated** — "will not accept any medical device AI that foregoes the decision of a human." The **Medical AI Consortium** — coordinated by NECTEC, with DMS/MOPH, and six founding faculties (Ramathibodi/Mahidol, Chulalongkorn, Chiang Mai, Prince of Songkla, Vajira, DMS hospitals) — has 90M baht in PMU-B funding plus a 120M baht NSTDA-DMS-Ramathibodi MoU, and has built a **Medical AI Data Platform (2.2M+ medical images)** plus **RadiiView** annotation software. The **RCRT** (Royal College of Radiologists of Thailand) operates an AI test-report page and has endorsed Siriraj's CXR-AI used in the NHSO rollout (55M→135M→225M baht FY2025–2027 across 167→445→887 hospitals). The **FUTURE-AI** framework (Lekadir et al. BMJ 2025) is the neutral principles anchor that avoids US/EU tribalism and includes Asian co-authors.
+
+International precedents for the consortium to align with: the **UK AI Standards Hub** (Turing + BSI + NPL) as a standards-literacy infrastructure model; **Duke Health AI Partnership (HAIP)** and its Model Facts Label, cited in the US ONC HTI-1 Final Rule; **EU EHDS** (Regulation (EU) 2025/327, force 26 March 2025) with FHIR-centric EEHRxF and Health Data Access Bodies; **Singapore Synapxe AimSG**; **MIDRC** (RSNA/AAPM/ACR + UChicago Gen3 platform) — the closest artifact-level precedent for a Thai imaging commons.
+
+### Proposal 1 — Publish a "Thai AI-SaMD Integration Profile"
+
+Align SIL-TH's FHIR Implementation Guides with **IHE AIR 1.3** and **IHE AIRA 2025** for verification workflow; specify HL7 v2 ORU^R01 mapping for HOSxP compatibility; require DICOM SEG (per Supplement 111) + DICOM SR TID 1500 + DICOM Parametric Map as the minimum emission set from any AI vendor registered with Thai FDA as SaMD. **Rationale:** no Thai profile currently bridges SIL-TH FHIR IGs, MOPH HDC requirements, and the IHE radiology-AI profile family. **Precedent:** UK AI Standards Hub and US Duke Model Facts Label / HTI-1 DSI Source Attributes. **Implementation burden:** moderate — leverage existing IHE AIR supplement text; add Thai-specific bindings for TMC / RCRT / MOPH identifiers. **First-mover value:** Thailand becomes the first ASEAN country with an IHE-aligned AI SaMD profile; sets ASEAN harmonization template.
+
+### Proposal 2 — Adopt the Ramathibodi canonical representation as a consortium reference model
+
+Publish a canonical internal JSON schema for AI results (see §11), explicitly mapping to DICOM SR TID 1500 + DICOM SEG + FHIR Observation + HL7 v2 ORU, with required fields for algorithm identity, input study UIDs, verification state, explainability artifact reference, and calibrated uncertainty. **Rationale:** the commercial market does not provide a canonical normalization; Blackford / Ferrum / deepcOS / PIN are passthrough routers. A reference schema lets consortium members share adapters and reduces per-hospital integration cost. **Precedent:** MIDRC's use of RadElement CDEs + DICOM SEG as a reference data model; ACR Assess-AI's consumption schema. **Implementation burden:** moderate — requires consortium-wide agreement. **First-mover value:** consortium-level ACL reduces integration cost for all 6 founding faculties; tender language becomes reusable.
+
+### Proposal 3 — Commit to Thai FDA locked-model-compatible packaging
+
+Mandate OCI-based packaging (MONAI MAP or CNCF ModelPack) with **Sigstore keyless signing + Rekor transparency log + SLSA attestation + embedded MONAI Bundle + Google-MCT-schema Model Card**, extended with Thai-FDA-specific fields (change-notification cycle, clinician-verification evidence, local validation cohort provenance). **Rationale:** Thai FDA's locked-model posture is stricter than FDA PCCP; the OCI + Sigstore stack gives tamper-evident version lineage that directly maps to Thai FDA change-notification requirements. **Precedent:** none in ASEAN; MIDRC provenance patterns adapt. **Burden:** low-moderate — tooling exists (Cosign, Sigstore model-transparency). **Value:** reduces Thai FDA registration preparation time (NECTEC's SaMD testing-lab stated goal) and positions Thailand to host international multi-center validation.
+
+### Proposal 4 — Fill the explainability and uncertainty PL gaps as a national contribution
+
+Propose to DICOM WG-23, via the RCRT + RSNA academic channel, a supplement defining (a) coded identities for explainability artifact types in a new DCM CID, with Parametric Map as the recommended carrier and a `RealWorldValueMappingSequence` pattern for relative attribution scores; (b) a calibration-metadata macro (temperature, Brier, coverage) for DICOM SR and a matching FHIR Observation extension. **Rationale:** these are the two largest global gaps and the consortium has the academic standing (RCRT, Ramathibodi/Mahidol, Siriraj, Chulalongkorn) plus the FUTURE-AI co-authorship connections to drive them. **Precedent:** DICOM supplements frequently originate in academic medical center needs. **Burden:** high — 2–3 year WG process. **Value:** a Thai-originated contribution to DICOM would be a first; positions Thailand as a standards contributor, not just consumer.
+
+### Proposal 5 — Operationalize FUTURE-AI as the consortium's principles anchor
+
+Adopt FUTURE-AI's six principles (Fairness, Universality, Traceability, Usability, Robustness, Explainability) as the consortium's published evaluation rubric, mapped to Thai FDA requirements and the NECTEC SaMD testing-lab capabilities. Publish a public-domain Thai AI Model Card template that extends Google MCT schema v0.0.2 with Thai-specific fields (NHSO reimbursement class, HOSxP integration evidence, RCRT validation cohort). **Rationale:** FUTURE-AI avoids the EU-vs-US framing problem, has Asian co-authors, and maps cleanly to Thai FDA's five themes (clinician-in-the-loop, locked model, cybersecurity/PDPA, local validation, IMDRF-alignment). **Precedent:** UK AI Standards Hub's posture toward ISO/IEC 42001. **Burden:** low. **Value:** coherent national framing for the 887-hospital CXR-AI rollout and all downstream Thai FDA submissions.
+
+---
+
+## 11. Recommendations for the Ramathibodi orchestration platform
+
+### 11.1 Recommended internal canonical representation
+
+A single canonical JSON object per AI inference result, designed to round-trip to DICOM SR TID 1500, DICOM SEG, DICOM Parametric Map, FHIR DiagnosticReport/Observation, and HL7 v2 ORU. Fields:
+
+```
+{
+  "result_id":        UUID (ACL-assigned, guaranteed stable),
+  "study_ref": { "StudyInstanceUID", "SeriesInstanceUIDs": [...], "SOPInstanceUIDs": [...] },
+  "patient_ref":      { "patient_id", "mrn", "fhir_patient_ref" },
+  "model": {
+    "vendor", "product", "algorithm_name", "version",
+    "fda_510k" | "ce_mark" | "thai_fda_reg", "udi",
+    "oci_digest", "sigstore_attestation"
+  },
+  "task":             "classification" | "segmentation" | "detection" | "landmark" | "regression" | "structured_finding",
+  "findings": [
+    {
+      "finding_code": { "system": "SNOMED|DCM|RadLex|RadElement", "code", "display" },
+      "laterality":   "left|right|bilateral|none",
+      "body_site":    { SNOMED code + RadLex anatomy },
+      "value":        { scalar OR categorical OR interval },
+      "unit":         UCUM,
+      "uncertainty": {
+        "probability":       0–1,
+        "confidence_interval": [lo, hi, coverage],
+        "calibration":       { "temperature", "brier", "method" }
+      },
+      "evidence": {
+        "segmentation_ref": DICOM SEG UID | internal volume URI,
+        "bbox":             { coord_frame: "LPS|RAS|pixel", [x1,y1,z1,x2,y2,z2] },
+        "points":           [{ coord_frame, [x,y,z], label }],
+        "saliency_ref":     Parametric Map UID | volume URI,
+        "salience_type":    "gradcam|attention|integrated_gradients|other"
+      },
+      "severity_code":     DCM 111012 certainty or SNOMED severity,
+      "radlex_cde":        RDES/RDE identifier when applicable
+    }
+  ],
+  "verification": {
+    "status":        "unverified|preliminary|final|rejected|modified",
+    "verifier":      FHIR Practitioner ref,
+    "verified_at":   ISO 8601,
+    "modifications": [{ before, after, radiologist_note }]
+  },
+  "provenance": {
+    "input_study_hashes": [...],
+    "execution_time",    "compute_environment",
+    "previous_result_ref": when supersedes
+  },
+  "emission_history": [{ target: "DICOM-SEG|SR|FHIR|HL7v2", uid, timestamp }]
+}
+```
+
+This model is explicitly shaped to minimize coupling to any single PL. Every field has a documented mapping to TID 1500 content items, SEG segment metadata, Parametric Map real-world-value mappings, FHIR Observation components, or HL7 v2 OBX segments. Uncertainty and explainability are first-class — filling the two largest global gaps internally even when vendors omit them.
+
+### 11.2 ACL boundary diagram
+
+```
+                         RAMATHIBODI AI SMART ORCHESTRATION PLATFORM
+   ─────────────────────────────────────────────────────────────────────────────────
+
+   ┌─────────────────────────────┐        ┌─────────────────────────┐
+   │ Commercial AI vendors       │        │ OSS/academic models     │
+   │ • Aidoc, Qure, Annalise     │        │ • MONAI Bundle          │
+   │ • Lunit, Viz.ai, Rad AI     │        │ • MedSAM / VISTA-3D     │
+   │ • Siemens AI-Rad Companion  │        │ • nnU-Net, RCRT CXR-AI  │
+   │ • Future vendors TBD        │        │ • SIL-TH registered     │
+   └────────────┬────────────────┘        └───────────┬─────────────┘
+                │                                     │
+                │ DICOM SC / SR / SEG / PM            │ OIP v2 (KServe/Triton)
+                │ HL7 ORU^R01 / REST JSON             │ DICOMweb on same cluster
+                │ Mobile push (Viz pattern)           │
+                ▼                                     ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │                    ACL_in (inbound normalization)            │
+   │                                                              │
+   │ • Per-vendor adapter modules (one per commercial vendor)     │
+   │ • OIP-to-canonical bridge for internal models                │
+   │ • DICOMweb Informatics Gateway (MIG-style) for pixel I/O     │
+   │ • Provenance stamper (vendor, version, input UIDs, result UID)│
+   │ • Ontology mapper (vendor labels → SNOMED/DCM/RadElement)    │
+   │ • Uncertainty promoter (vendor score → canonical uncertainty) │
+   └──────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+               ┌──────────────────────────────────┐
+               │  Internal Canonical Result Store │
+               │  (canonical JSON per §11.1)      │
+               │  • Postgres + object storage     │
+               │  • Event bus (Kafka/NATS)        │
+               │  • IHE AIRA verification state   │
+               └──────────────┬───────────────────┘
+                              │
+                              ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │                  ACL_out (outbound translation)              │
+   │                                                              │
+   │ • DICOM SEG emitter (highdicom)         → STOW-RS to PACS    │
+   │ • DICOM SR TID 1500 emitter (highdicom) → STOW-RS to PACS    │
+   │ • DICOM Parametric Map emitter          → STOW-RS to PACS    │
+   │ • FHIR DiagnosticReport + Observation   → Health Link / EHR  │
+   │ • HL7 v2 ORU^R01 emitter                → HOSxP integration  │
+   │ • Mobile notification emitter           → radiologist app    │
+   │ • IHE AIRA VerificationFlag round-trip  → PACS updates       │
+   └──────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+                 ┌─────────────────────────┐
+                 │ HIS / RIS / PACS / EHR  │
+                 │ • HOSxP XE              │
+                 │ • Fujifilm Synapse PACS │
+                 │ • Health Link HIE       │
+                 │ • NHSO reimbursement    │
+                 │ • ACR Assess-AI-style   │
+                 │   quality registry      │
+                 └─────────────────────────┘
+```
+
+### 11.3 PL adoption roadmap
+
+**MVP (0–6 months):** OIP v2 as internal transport PL; ONNX as weight format; MONAI Bundle for any in-house model; DICOMweb ingress/egress via a MIG-style gateway; HL7 v2 ORU^R01 for HOSxP; DICOM Secondary Capture fallback for explainability. Per-vendor adapters for the two highest-volume commercial AI (NHSO CXR-AI plus one CT triage vendor). Canonical representation implemented but minimal fields populated.
+
+**v1.5 (6–18 months):** MONAI Application Package (MAP) as deployment container for in-house models; add DICOM SEG emission via highdicom; add DICOM SR TID 1500 emission for structured findings with RadElement CDE binding; add FHIR DiagnosticReport + Observation output to Health Link and major EHR; add IHE AIRA VerificationFlag round-trip. Per-vendor adapters for all commercial vendors in production. DICOM Parametric Map for probability volumes. Uncertainty fields populated where vendors expose them.
+
+**Deferred / dependent on standards maturation (18+ months):** Thai AI-SaMD Integration Profile adoption once consortium publishes; CNCF ModelPack + Sigstore + Rekor for Thai-FDA-locked-model packaging; HL7 AI Transparency IG security labels once normative; IHE AIW-I full orchestration replacing per-vendor scheduling; explainability artifact supplement once DICOM WG-23 advances; calibration metadata macro adoption. SAM-family promptable-segmentation PL formalization follow-on.
+
+---
+
+## 12. Appendix — Per-project evaluation cards
+
+**KServe Open Inference Protocol v2** — Governance: CNCF Incubating (Sep 2025). License: Apache 2.0. DDD: Designed PL (emerging). Radiology fit: internal only; requires DICOMweb ACL. Adoption: Triton, MLServer, OpenVINO, AMD, TorchServe partial.
+
+**NVIDIA Triton** — BSD-3. Designed PL extending OIP. Backbone of MONAI Deploy, Clara, Siemens AI-Rad Companion. Adds non-portable extensions (binary_data, classification, sequence_id).
+
+**DICOMweb** — NEMA/MITA. Free. Designed PL, universal. Not an inference protocol per se; wrapped for DICOMweb-native inference by MIG, Google adapter, Alvearie.
+
+**IHE AIW-I Rev 1.3 / AIR Rev 1.3 (2025-08-08) / AIRA 2025-06-12** — IHE Radiology TC. Free. Designed PLs. Trial implementation. Plugathon-tested (VISUS, IAIP partners); no vendor publishes formal Integration Statement.
+
+**ONNX** — LF AI & Data. Apache 2.0. Designed PL (narrow: graph only). Ubiquitous. Weak for DICOM preprocessing, custom 3D ops.
+
+**MONAI Bundle** — Project MONAI. Apache 2.0. Designed PL with NVIDIA-leaning governance; strongest domain-rich schema. Adopted in MONAI Zoo, mercure, Siemens Digital Marketplace, Mayo, DKFZ, MSK.
+
+**MONAI Application Package (MAP)** — Project MONAI. Apache 2.0. Designed PL for deployment, OCI-based, wraps Bundle. Adopted in mercure, Siemens, AI Centre VBH, Nuance PIN.
+
+**CNCF ModelPack / KitOps ModelKit** — CNCF Sandbox (June / May 2025). Apache 2.0. Designed PL, general-purpose. Minimal radiology adoption. Best-in-class Sigstore + SLSA integration.
+
+**Hugging Face Hub + Model Cards** — HF Inc. (private). Emergent PL, vendor-controlled. Research distribution. Model Card YAML front-matter is de facto metadata schema; Google MCT JSON schema is the formalized alternative.
+
+**SAM prompt/mask schema (SAM, MedSAM, SAM 2, MedSAM2, VISTA-3D, SegVol, SAM-Med3D, ScribblePrompt, nnInteractive)** — Meta origin; code-level convention. Emergent PL with strong diffusion. No spec, no version. {points+labels, boxes, mask_input} → {masks, iou, low_res_logits}.
+
+**DICOM SEG Supplement 111** — DICOM WG-17 (2008 normative). Free. Designed PL. Supported natively in all major PACS; highdicom / dcmqi reference tools.
+
+**DICOM SR TID 1500 + 1411 + 4100/4300/4120/4129** — DICOM WG-23/WG-08. Free. Designed PL. TID 1500 dominant for modern AI; CAD TIDs persist for mammography/chest backward compatibility.
+
+**DICOM Parametric Map Supplement 172** — Correct container for heatmaps/probability volumes/saliency. Adoption modest; most PACS render only as pseudo-color overlay.
+
+**DICOM Supplement 219 JSON-SR** — WG-23 trial implementation. The key AI enabler: lets ML engineers author TID 1500 in JSON with automatic binary-SR serialization.
+
+**FHIR R4/R4B** — HL7. Free. Designed PL. DiagnosticReport + Observation + Device + Provenance + RiskAssessment. AI Transparency IG at ballot v1.0.0 (2025).
+
+**ACR Assess-AI** — ACR DSI (2024 production). Consumer registry, not emitter PL. Uses ACR Connect on-prem + Amazon Bedrock LLM extraction.
+
+**RadElement CDE** — RSNA/ACR. Free. Designed terminology PL. Fastest-growing radiology-AI-specific structured observation vocabulary.
+
+**FUTURE-AI** — International consortium, BMJ 2025. CC-BY. Meta-PL / principles. Six principles (Fairness, Universality, Traceability, Usability, Robustness, Explainability), 30 best practices across lifecycle. The neutral framing for the Thai consortium.
+
+**MIDRC** — NIH/NIBIB + RSNA/ACR/AAPM + UChicago. Free/regulated access. Uses DICOM SEG + SR + RadElement + RadLex + TCIA tooling. The most useful academic consortium artifact for the Thai consortium to align with.
+
+**Commercial vendor output reality (Aidoc, Qure, Annalise, Lunit, Viz, Siemens, Blackford, Ferrum, Incepto, deepcOS, Nuance PIN)** — Dominant pattern: DICOM Secondary Capture + proprietary HL7 ORU + vendor REST. Minority output: DICOM SR (Siemens AI-Rad Companion, Qure.ai). Rare output: DICOM SEG / Parametric Map (Siemens RT modules, Viz CTP, NeuroQuant). Effectively absent: native FHIR. Orchestrators are passthrough routers, not canonical normalizers — which is the seam Ramathibodi's platform fills.
+
+---
+
+*End of report. This document is intended to sit alongside `OSS_Landscape_BuildingBlock_DeepResearch.md` and inform both the Ramathibodi AI Smart Orchestration Platform architecture and the Thailand Medical AI Consortium proposal. Confidence levels are flagged throughout; healthcare-adoption claims are backed by at least one named vendor/hospital/project where possible, with explicit low-confidence labels where only vendor marketing was available. Primary sources are cited inline by project and URL in each axis section.*
