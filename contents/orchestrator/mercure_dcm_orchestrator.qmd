@@ -1,0 +1,143 @@
+---
+title: "Mercure DICOM Orchestrator"
+---
+
+
+Here's a consolidated summary of **mercure DICOM Orchestrator**, drawing on the official documentation, the mercure GitHub organization, and NYU Langone's CAI2R resource pages. I've also noted how it fits into your OSS landscape analysis.
+
+## Origin & positioning
+
+mercure is an open-source DICOM orchestration platform developed at **NYU Langone Health (CAI2R)** by Kai Tobias Block's group, released under the permissive **MIT license**. It offers a web-based UI, extensive monitoring, and is designed for routine applications requiring high availability — dispatching DICOM studies to different targets based on routing rules, and processing DICOM series with custom algorithms including AI inference. The current release line is **0.4.0-beta.7** (April 2025), and the project is still under active development.
+
+It was previously called **Hermes** — if you encounter old references, that's the same project.
+
+## System architecture
+
+mercure uses a **modular, service-oriented architecture** where each stage of the DICOM pipeline is a separate service. If one module crashes or needs restart, the others keep running — the receiver, for example, continues accepting images from scanners. Modules can also be scaled out independently when more throughput is needed.
+
+```
+             ┌─────────────────────────────────────────────────────────┐
+             │                      mercure server                     │
+             │                                                         │
+  DICOM      │  ┌──────────┐    ┌────────┐     ┌───────────┐           │
+  C-STORE ──▶│──│ Receiver │───▶│ Router │───▶ │ Processor │──┐        │
+ (scanners,  │  │ (DCMTK + │    │ (rule  │     │ (Docker   │  │        │
+  PACS)      │  │  getdcm- │    │ engine)│     │  modules, │  │        │
+             │  │  tags)   │    │        │     │  incl.    │  │        │
+             │  └──────────┘    └────────┘     │  MONAI    │  │        │
+             │                                 │  MAPs)    │  │        │
+             │                                 └───────────┘  │        │
+             │                                                ▼        │
+             │                                         ┌────────────┐  │
+             │                                         │ Dispatcher │──┼──▶ PACS / VNA /
+             │                                         │(DICOM/SFTP)│  │    Workstation /
+             │                                         └────────────┘  │    Cloud / SFTP
+             │  ┌──────────┐          ┌────────────┐   ┌────────────┐  │
+             │  │ Cleaner  │          │ Bookkeeper │◀─▶│   WebGUI   │  │
+             │  │(retention│          │ (central   │   │(rules/tgts/│  │
+             │  │ sweeper) │          │  monitor,  │   │ modules,   │  │
+             │  │          │          │  TCP/IP)   │   │ audit)     │  │
+             │  └──────────┘          └────────────┘   └────────────┘  │
+             └─────────────────────────────────────────────────────────┘
+```
+
+The seven core services:
+
+- **Receiver** — listens on a TCP port for incoming DICOM associations. It runs a preprocessing step that extracts DICOM tags into a JSON file used later by the rule engine. Built on **DCMTK** (storescp under the hood).
+- **Router** — applies user-defined rules against the extracted tags. If a rule matches, the series is copied into outgoing/processing folders; otherwise it lands in *discard*.
+- **Processor** — runs processing operators packaged as Docker containers, which makes it easy to integrate algorithms in any language/framework. It also supports MONAI Application Packages (MAPs) natively.
+- **Dispatcher** — transfers results to target nodes via DICOM or SFTP, with configurable retries and error-folder fallback.
+- **Cleaner** — deletes successfully dispatched and discarded series after a configurable retention window (which means you can retro-process studies whose rules didn't yet exist).
+- **WebGUI** — management UI for rules, targets, modules, user accounts, and job auditing.
+- **Bookkeeper** — central monitoring service; all other services report to it over TCP/IP and it backs the audit/structured-result database.
+
+**Tech stack:** Python application layer, DCMTK for DICOM transport, Docker for processing isolation. Deployments come in two flavors — a containerized single-server install via Docker Compose, or a scalable cluster install using HashiCorp Nomad.
+
+## Integration
+
+```
+                    ┌────────────────────────────────────────────┐
+                    │              Integration surfaces          │
+                    └────────────────────────────────────────────┘
+
+  INBOUND                       PROCESSING                OUTBOUND
+  ───────                       ──────────                ────────
+  • DICOM C-STORE               • Custom Docker modules   • DICOM C-STORE
+    (from scanners,               (any language)            (to PACS/VNA/
+     PACS, workstations)        • MONAI Application         workstations)
+  • PACS polling                  Packages (MAPs)         • SFTP transfer
+    (C-MOVE/C-FIND for          • Local GPU or Nomad      • Cloud targets
+     batch/historical data)       cluster execution         (via dispatcher)
+                                • Modules distributed
+  ANCILLARY                       via Docker Hub          NOTIFICATIONS
+  ─────────                                               ─────────────
+  • CLI: manage.py              RESULT STORAGE            • Email
+  • DICOM Query / Upload        ─────────────             • Webhooks
+    tools (new in 0.4)          • Postgres-backed           (Slack, Teams,
+  • Webhook ingress from          structured results        custom HTTP)
+    modules                     • Queryable via          • Templated
+                                  Metabase / Redash /       messages
+                                  Superset                • Module-triggered
+                                                            alerts
+```
+
+Notable integration points for your platform:
+
+- **MONAI MAP first-class support** — this is the key interoperability story. A MAP developed with the MONAI Deploy App SDK can be dropped into mercure as a processing module with only minor config (module type set to "MONAI", root privileges enabled). This is exactly the **Published Language** story from your DDD report: mercure consumes MAP as the model-packaging PL.
+- **Docker Hub as a module registry** — `mercureimaging/map-monaiclassify`, `mercureimaging/mercure-monaisegment`, and others are pulled directly. Your team could publish modules to a private registry under `ramaai-dev` or `radrama-ai`.
+- **PACS polling** for retrospective cohort processing — useful for research batch runs and for PIE validation against historical data.
+- **Structured result store** — modules emit JSON results into mercure's database, which Metabase/Redash/Superset can query. This gives you a low-effort route to monitoring dashboards (FR-16 through FR-19 in your PRD) without building a separate analytics layer.
+- **Notifications** — webhooks + email + templating mean you can plug critical-finding alerts into Slack, Teams, or LINE (relevant for Thailand hospital workflows).
+
+What mercure does **not** natively handle:
+- No FHIR or HL7 v2 emission — you'd need an ACL_out adapter (as the Published Languages report describes) to hit HOSxP or EHR endpoints.
+- No built-in IHE AIW-I / AIR profile compliance — DICOM-centric only.
+- No model registry / experiment tracking — pair with MLflow.
+- No drift detection or post-market monitoring — pair with Evidently + NannyML.
+
+## Use cases
+
+From the official docs, the MONAI blog post, and the CAI2R description:
+
+1. **Study-dependent routing** — e.g., auto-route all cardiac MR studies to dedicated CMR software, or screening mammograms to a specific CAD workstation. This is the "traditional" DICOM-router role, but configurable via rules instead of scanner-side setup.
+2. **Clinical AI inference on receipt** — trigger segmentation, classification, or detection models when a matching study arrives. Examples from the mercure-imaging GitHub org include:
+   - **TotalSegmentator module** — 104-class CT segmentation.
+   - **Lung nodule detection MAP** — extends the MONAI `lung_nodule_ct_detection` bundle with email notification when nodules are detected and bounding-box DICOM output.
+   - **Spleen segmentation MAP** — based on the MONAI spleen bundle.
+   - **Radiomics module** — structured feature extraction.
+   - **Prostate segmentation tutorial** — slice-by-slice U-Net with color-blended output.
+3. **Research study tracking** — auto-detect when a specific protocol has been performed and notify the research team.
+4. **Anonymization for research** — the `mercure-anonymizer` module removes PHI; results can be indexed and searched via `pacs_studyfinder` (both under mercure-imaging).
+5. **Cohort / population-level analytics** — structured module results stored in the database can be queried with Metabase, Redash, or Superset to explore population-level findings and radiomics trends.
+6. **Hybrid on-prem / cloud processing** — dispatch sensitive studies to on-prem modules, less-sensitive ones to cloud instances.
+
+## Fit with your AI Smart Orchestration Platform
+
+Your OSS landscape report already marks mercure as **"Adopt — production-ready for radiology AI routing"**, and I'd reinforce that with some nuance for your PRD:
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                  Your platform, mercure's role                  │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                 │
+  │  FR-01/02/03  (HIS/RIS/PACS integration, routing)    ✅ STRONG  │
+  │  FR-04        (multiple concurrent models)           ✅ STRONG  │
+  │  FR-05        (API gateway, auth)                    ⚠️ PARTIAL │
+  │                — WebGUI has user accounts, but no                │
+  │                  external API gateway; pair with Kong/          │
+  │                  Traefik or MONAI Informatics Gateway           │
+  │  FR-06        (model registry)                       ❌ NONE    │
+  │                — pair with MLflow + MONAI Bundle                │
+  │  FR-07–10     (PIE pipeline, sandbox)                ⚠️ PARTIAL │
+  │                — retention window enables retro runs;           │
+  │                  pair with Evidently/Deepchecks                 │
+  │  FR-11–15     (PMS, drift, fairness)                 ❌ NONE    │
+  │                — pair with Evidently + NannyML +                │
+  │                  AIF360/Fairlearn                               │
+  │  FR-16–20     (dashboards)                           ⚠️ PARTIAL │
+  │                — Metabase/Superset on mercure DB                │
+  │                  covers usage volume + model breakdown;         │
+  │                  augment with Grafana for infra                 │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+```

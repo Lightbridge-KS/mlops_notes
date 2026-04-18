@@ -31,6 +31,10 @@ book:
       chapters: 
         - text: "IOMapping in MonaiBundleInferenceOperator"
           href: "contents/monai/monai_IOMapping.qmd"
+    - part: Orchestrator
+      chapters: 
+        - text: "Mercure DICOM Orchestrator"
+          href: "contents/orchestrator/mercure_dcm_orchestrator.qmd"
     - part: Landscape & Protocols
       chapters: 
         - text: "OSS Landscape for AI Orchestraction"
