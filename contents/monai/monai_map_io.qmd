@@ -1,0 +1,293 @@
+---
+title: "MAP Container I/O — The Contract"
+---
+
+At the highest level, a MAP speaks **filesystem, not network**. The contract is deliberately simple so any orchestrator (mercure, Workflow Manager, Kubernetes Job, a bash script) can drive it the same way.
+
+```
+          ┌───────────────────────────────────────────────┐
+          │              MAP Container                    │
+          │                                               │
+   ┌──▶ /var/monai/input/        (read-only bind mount)   │
+   │      • DICOM files here                              │
+   │                                                      │
+   │                          ┌────────────────────────┐  │
+   │                          │  App SDK runtime runs  │  │
+   │                          │  the Operator DAG      │  │
+   │                          └────────────────────────┘  │
+   │                                                      │
+   └──◀ /var/monai/output/       (read-write bind mount)  │
+          • DICOM SEG / SR / PM written here              │
+          │                                               │
+          └───────────────────────────────────────────────┘
+            + environment variables (runtime parameters)
+            + /etc/monai/app.json    (declares the contract)
+```
+
+This is intentional. By making the boundary a **directory with DICOM files**, MAP stays orchestrator-agnostic. Compare with OIP/Triton which requires you to speak gRPC/HTTP — that's a tighter coupling to a serving framework.
+
+---
+
+## The Input Side
+
+### Primary input: a DICOM *study* or *series* as files on disk
+
+When the orchestrator invokes the MAP, it mounts a directory containing the DICOM instances for a single study (or sometimes a single series). The App SDK runtime discovers them via `DICOMDataLoaderOperator`, which is the first node in almost every MAP's DAG.
+
+```
+/var/monai/input/
+├── 1.2.840.113619.2.5.1762.4.20260418.123.dcm
+├── 1.2.840.113619.2.5.1762.4.20260418.124.dcm
+├── 1.2.840.113619.2.5.1762.4.20260418.125.dcm
+│       ...
+└── 1.2.840.113619.2.5.1762.4.20260418.523.dcm
+        (flat layout — filenames are arbitrary;
+         SOPInstanceUIDs are read from DICOM tags)
+```
+
+The loader does not care about the file names — it reads DICOM headers, reconstructs the study/series/instance hierarchy from `StudyInstanceUID` / `SeriesInstanceUID` / `SOPInstanceUID`, and hands a structured representation to the next Operator.
+
+### What the loader produces internally
+
+```
+   DICOMDataLoaderOperator
+            │
+            ▼
+   ┌────────────────────────────────────────┐
+   │  DICOMStudy                            │
+   │    StudyInstanceUID: 1.2.…             │
+   │    StudyDescription: "CT CHEST W/O"    │
+   │    PatientID: 12345                    │
+   │    ├── DICOMSeries                     │
+   │    │     SeriesInstanceUID: 1.2.…      │
+   │    │     Modality: CT                  │
+   │    │     BodyPartExamined: CHEST       │
+   │    │     SliceThickness: 1.0           │
+   │    │     ContrastBolusAgent: ""        │
+   │    │     ├── DICOMInstance × N         │
+   │    │     │     SOPInstanceUID          │
+   │    │     │     PixelData (bytes)       │
+   │    │     │     + all other tags        │
+   │    │     └── ...                       │
+   │    └── DICOMSeries × M                 │
+   └────────────────────────────────────────┘
+```
+
+This is the in-memory model `DICOMSeriesSelectorOperator` filters, and what `DICOMSeriesToVolumeOperator` turns into a 3D NumPy array with spacing and orientation.
+
+### Supported input modalities (format-wise)
+
+| Input type | Typical Operator | When to use |
+|---|---|---|
+| **DICOM (single-frame, classic)** | `DICOMDataLoaderOperator` | The 99% case — CT, MR, CR, DX |
+| **DICOM Enhanced / Multi-frame** | same loader | Modern MR, multi-frame CT |
+| **NIfTI / NRRD / MetaImage** | `NiftiDataLoaderOperator` or Bundle's `LoadImaged` | Research/batch jobs, not PACS-driven |
+| **TIFF, PNG (digital path/dermatology)** | custom loader Operator | Non-radiology domains |
+
+For your Rama platform, focus on DICOM input — that's what mercure, MIG, and the Workflow Manager deliver.
+
+### Secondary inputs: environment variables
+
+These parameterize the MAP without rebuilding it. The App SDK reads a set of well-known env vars:
+
+```bash
+HOLOSCAN_INPUT_PATH   = /var/monai/input       # where DICOM lives
+HOLOSCAN_OUTPUT_PATH  = /var/monai/output      # where to write
+HOLOSCAN_MODEL_PATH   = /opt/holoscan/models   # bundle location
+HOLOSCAN_LOG_LEVEL    = INFO
+```
+
+You rarely override these at runtime — they're defaults baked into `app.json`. But knowing they exist matters if you're writing custom orchestrator dispatch code.
+
+---
+
+## The Output Side
+
+This is the more interesting half, because the **type of output depends on the clinical task** and there are multiple valid DICOM formats.
+
+### Output catalogue by task
+
+```
+  Task                          Typical DICOM output         Supplement
+  ─────────────────────────     ────────────────────────     ──────────
+  Segmentation (lung, tumor)    DICOM SEG                    Sup 111
+  Quantitative map              DICOM Parametric Map         Sup 172
+    (ADC, heatmap, prob vol)
+  Structured finding            DICOM SR (TID 1500)          Sup 23 + Sup 219
+    (CAD, measurements)
+  Classification / triage       DICOM SR (TID 1500) or       Sup 23
+                                Encapsulated PDF + SR
+  Burned-in annotation          DICOM Secondary Capture      PS3.3
+    (fallback, lowest common    (JPEG-with-overlay)          "SC" IOD
+     denominator)
+  Structure set (RT-aligned)    DICOM RT-STRUCT              (RT standard)
+```
+
+### Output directory layout
+
+```
+/var/monai/output/
+├── seg.dcm                          ← DICOM SEG instance
+│    • Same FrameOfReferenceUID as source CT
+│    • SegmentSequence: [{0: bg, 1: left_lung, 2: right_lung}]
+│    • BinaryFraction or Fractional
+│    • SNOMED codes per segment
+│
+├── sr.dcm                           ← DICOM SR (TID 1500)
+│    • Measurements, findings
+│    • Points to the seg.dcm by UID reference
+│    • Evidence: links back to source series
+│
+├── pm.dcm                           ← Parametric Map (optional)
+│    • Probability heatmap per voxel
+│
+└── app.log                          ← runtime log (useful for audit)
+```
+
+Each output DICOM is a **standards-compliant instance** — any PACS that speaks DICOM will accept it via C-STORE or STOW-RS. That's the whole architectural point.
+
+### The cross-referencing that makes outputs clinical-grade
+
+Outputs are not standalone files. They are **cryptographically linked** back to the source study through DICOM UIDs, which is how PACS knows to display the SEG over the original CT:
+
+```
+  Source CT series                    MAP outputs
+  ─────────────────                   ───────────
+
+  StudyInstanceUID:    S1   ────────▶ SEG.StudyInstanceUID:          S1
+  SeriesInstanceUID:   S1.1 ────────▶ SEG.ReferencedSeriesSequence:  S1.1
+  FrameOfReferenceUID: F1   ────────▶ SEG.FrameOfReferenceUID:       F1
+                                      SEG.SeriesInstanceUID:         NEW
+                                      SEG.SOPInstanceUID:            NEW
+
+                                      SR.ContentSequence → references
+                                        SEG.SOPInstanceUID and each
+                                        source-image SOPInstanceUID
+```
+
+`highdicom` (used by `DICOMSegmentationWriterOperator`) handles all this bookkeeping. Get this wrong and Synapse PACS will display the SEG floating in space, unanchored from the CT — a classic radiology AI bug.
+
+---
+
+## The `app.json` Manifest — the Formal Contract
+
+This file lives inside the MAP at `/etc/monai/app.json` and is what an orchestrator reads to understand the I/O expectations *before* running the container:
+
+```json
+{
+  "apiVersion": "1.0",
+  "command": ["python", "-m", "monai.deploy.runner",
+              "/opt/holoscan/app/app.py"],
+  "environment": {
+    "HOLOSCAN_INPUT_PATH":  "/var/monai/input",
+    "HOLOSCAN_OUTPUT_PATH": "/var/monai/output",
+    "HOLOSCAN_MODEL_PATH":  "/opt/holoscan/models"
+  },
+  "input": {
+    "path":    "input/",
+    "formats": ["dicom"]
+  },
+  "output": {
+    "path":    "output/",
+    "formats": ["dicom-seg", "dicom-sr"]
+  },
+  "resources": {
+    "cpu":        2,
+    "gpu":        1,
+    "memory":     "8Gi",
+    "gpu_memory": "8Gi"
+  },
+  "timeout": 300,
+  "version": "1.0.3"
+}
+```
+
+Think of `app.json` as the **API spec of the container**. mercure reads it. The Workflow Manager reads it. Your future Python dispatcher will read it. Three consumers, one contract.
+
+---
+
+## End-to-End I/O Journey
+
+Here's the complete input-to-output flow with actual data on each wire:
+
+```
+                                                           Source PACS (Synapse)
+                                                                  │
+                                                                  │ C-STORE push
+                                                                  │ StudyInstUID = S1
+                                                                  ▼
+                                                       ┌─────────────────────┐
+                                                       │ MONAI Informatics   │
+                                                       │ Gateway (MIG)       │
+                                                       │ • Receives DIMSE    │
+                                                       │ • Stores files      │
+                                                       │ • Notifies router   │
+                                                       └──────────┬──────────┘
+                                                                  │
+                                                                  │ files on disk
+                                                                  ▼
+                                                       ┌─────────────────────┐
+                                                       │ mercure /           │
+                                                       │ Workflow Manager    │
+                                                       │ (rule engine)       │
+                                                       │ "CT + CHEST         │
+                                                       │  → rama-lung-seg"   │
+                                                       └──────────┬──────────┘
+                                                                  │
+                                   docker run --gpus all \        │
+                                     -v input:/var/monai/input    │
+                                     -v output:/var/monai/output  │
+                                     ghcr.io/ramaai-dev/…:1.0.3   │
+                                                                  ▼
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │                           MAP CONTAINER                                    │
+  │                                                                            │
+  │  INPUT: /var/monai/input/*.dcm                                             │
+  │    ├─ N = 200 CT instances                                                 │
+  │    ├─ Modality=CT, BodyPart=CHEST, Contrast=""                             │
+  │    └─ StudyInstanceUID=S1, FrameOfReferenceUID=F1                          │
+  │                                  │                                         │
+  │                                  ▼                                         │
+  │   DICOMDataLoaderOperator   → DICOMStudy object (in memory)                │
+  │   DICOMSeriesSelectorOp     → picks the axial non-contrast series          │
+  │   DICOMSeriesToVolumeOp     → np.ndarray (200, 512, 512) float32 HU        │
+  │                                  │                                         │
+  │                                  │  Bundle layer takes over                │
+  │                                  ▼                                         │
+  │   MonaiBundleInferenceOp    → preprocessing (Compose) → network →          │
+  │                               postprocessing (argmax, invertd, etc.)       │
+  │                             → np.ndarray (200, 512, 512) uint8 labels      │
+  │                                  │                                         │
+  │                                  ▼                                         │
+  │   DICOMSegmentationWriter   → highdicom builds SEG instance:               │
+  │                                 • FrameOfReferenceUID = F1 (inherited)     │
+  │                                 • SegmentSequence with SNOMED codes        │
+  │                                 • ReferencedSeriesSequence → S1.1          │
+  │                                                                            │
+  │  OUTPUT: /var/monai/output/seg.dcm                                         │
+  │                                                                            │
+  └──────────────────────────────────┬─────────────────────────────────────────┘
+                                     │
+                                     ▼
+                          Orchestrator collects seg.dcm
+                                     │
+                                     │  STOW-RS (DICOMweb)
+                                     ▼
+                             Destination PACS (Synapse)
+                                     │
+                                     ▼
+                      Radiologist opens CT study → sees
+                      lung SEG overlaid automatically
+                      (PACS honors FrameOfReferenceUID link)
+```
+
+---
+
+## Three Things Worth Knowing That Trip Up Real Deployments
+
+**1. Input is a *study's worth of files*, not a single tensor.** Unlike a Triton request which sends one tensor, a MAP receives a whole directory and decides what to use. The selection rule (inside `DICOMSeriesSelectorOperator`) is part of your contract — misconfigure it and the MAP silently runs on the wrong series (e.g., the localizer instead of the axial).
+
+**2. Orientation and spacing are input but not from the mount.** The Bundle's `Orientationd` and `Spacingd` transforms read these from DICOM tags, not from any external config. If the source PACS strips or corrupts `ImageOrientationPatient` or `PixelSpacing`, the MAP will process garbage and you won't see a visible error — just bad segmentations. This is the single most common radiology AI deployment bug.
+
+**3. Output UIDs must be NEW, but reference UIDs must match source.** `SEG.SOPInstanceUID` is freshly generated; `SEG.FrameOfReferenceUID` and `SEG.ReferencedSeriesSequence.SeriesInstanceUID` must be copied exactly from the source. `highdicom` handles this correctly; a naive implementation with `pydicom` alone often gets it wrong. This is another reason to stay on the App SDK built-in Operators rather than roll your own.
+

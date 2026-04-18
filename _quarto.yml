@@ -27,6 +27,10 @@ book:
           href: "contents/monai/nonai_map_example.qmd"
         - text: "MONAI Bundle, App SDK, MAP"
           href: "contents/monai/monai_map-appsdk-bundle.qmd"
+        - text: "MAP Container I/O"
+          href: "contents/monai/monai_map_io.qmd"
+        - text: "Orchestrator & MAP Container"
+          href: "contents/monai/monai_map-x-orchestrator.qmd"
     - part: MONAI Details
       chapters: 
         - text: "IOMapping in MonaiBundleInferenceOperator"

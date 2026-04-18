@@ -1,0 +1,274 @@
+# Communication Patterns Between Workflow Orchestrator and MAP Container
+
+Your diagram captures the **logical** contract (DICOM in, DICOM out). But because MAP is a filesystem-based container, the orchestrator and MAP never "talk" directly — they coordinate through a **shared medium** plus a **lifecycle signal**. That split is what creates the family of patterns.
+
+Three things always need to be coordinated, regardless of pattern:
+
+```
+  ┌─────────────┐                              ┌──────────────┐
+  │ Orchestrator│                              │ MAP Container│
+  └─────────────┘                              └──────────────┘
+         │                                             │
+         │ ① How do I start the MAP?                   │
+         │──────────── LAUNCH ────────────────────────▶│
+         │                                             │
+         │ ② How does DICOM get in and out?            │
+         │◀────── DATA TRANSFER MEDIUM ───────────────▶│
+         │                                             │
+         │ ③ How do I know it finished?                │
+         │◀───────── COMPLETION SIGNAL ────────────────│
+         │                                             │
+```
+
+Every pattern below is a different answer to those three questions.
+
+---
+
+## Pattern 1 — Direct `docker run` (process lifecycle)
+
+The simplest, most common pattern. Used by **mercure**, by the MONAI Deploy Workflow Manager in its local mode, and by almost every dev setup. The three signals collapse into Docker's own primitives.
+
+```
+  ┌──────────────────────┐                    ┌──────────────────────┐
+  │  Orchestrator        │                    │  Host filesystem     │
+  │  (mercure module)    │                    │                      │
+  │                      │  writes DICOM      │  /srv/jobs/<uuid>/   │
+  │                      │ ──────────────────▶│     input/           │
+  │                      │                    │       study_S1/*.dcm │
+  │                      │                    │     output/          │
+  │                      │                    │                      │
+  │                      │                    └──────────┬───────────┘
+  │                      │                               │ bind-mount
+  │                      │                               ▼
+  │                      │    docker run --rm \          │
+  │                      │      --gpus all \             │
+  │                      │      -v .../input:/var/monai/input:ro \
+  │                      │      -v .../output:/var/monai/output \
+  │                      │      ghcr.io/rama/lung-seg:1.0.3
+  │                      │                               │
+  │                      │    ┌──────────────────────────▼────────┐
+  │                      │    │   MAP Container (short-lived)     │
+  │                      │    │   runs DAG, writes seg.dcm, exits │
+  │                      │    └──────────────────────────┬────────┘
+  │                      │                               │
+  │    exit code = 0     │◀──────────────────────────────┘
+  │  ◀───────────────────│                               │
+  │                      │                               │
+  │  reads output/*.dcm  │                               │
+  │  ◀───────────────────│◀──────────────────────────────┘
+  └──────────────────────┘
+```
+
+**How the three signals map:**
+- **Launch:** `docker run` (or `podman run`) command.
+- **Data transfer:** bind-mounted host directories.
+- **Completion:** process exit code; orchestrator blocks on `docker wait`.
+
+This is synchronous and coupled to one host. If the orchestrator dies mid-run, the MAP keeps running but nobody collects its output. Works great up to a few hundred studies per day on a single GPU box. This is almost certainly where you should start for Rama MVP.
+
+---
+
+## Pattern 2 — Kubernetes `Job` + PVC (cluster-native)
+
+Once you have more than one GPU node, Pattern 1 stops scaling. Kubernetes Jobs wrap the same semantics with a scheduler.
+
+```
+  ┌──────────────────────┐
+  │ Orchestrator         │
+  │ (controller pod)     │
+  └──────────┬───────────┘
+             │
+             │ kubectl apply -f job.yaml
+             │ (or client-go)
+             ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │                  Kubernetes API Server                     │
+  └─────────┬──────────────────────────────────────────────────┘
+            │ schedules to GPU node
+            ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                        Pod                                  │
+  │                                                             │
+  │   ┌─────────────┐     ┌─────────────────┐                   │
+  │   │ initContainer│────▶│  MAP Container  │                  │
+  │   │ (optional):  │     │ /var/monai/in   │                  │
+  │   │ copy DICOM   │     │ /var/monai/out  │                  │
+  │   │ from S3      │     │                 │                  │
+  │   └─────────────┘     └────────┬────────┘                   │
+  │                                │                            │
+  │   ┌────────────────────────────┴─────────┐                  │
+  │   │  PVC  (ReadWriteMany NFS / CephFS)   │                  │
+  │   └──────────────────────────────────────┘                  │
+  └─────────────────────────────────────────────────────────────┘
+             │
+             │ Job.status.succeeded = 1
+             ▼
+  ┌──────────────────────┐
+  │ Orchestrator watches │
+  │ Job → reads PVC      │
+  └──────────────────────┘
+```
+
+**How the three signals map:**
+- **Launch:** `Job` object submission to K8s API.
+- **Data transfer:** PVC (NFS, CephFS, or similar — must be RWX).
+- **Completion:** Job watch event (`status.succeeded`) or callback via Argo/Volcano/Kueue.
+
+Mature choice for a multi-node hospital cluster. Gives you retries, timeouts, resource scheduling, RBAC. The tradeoff is operational weight — you now own a K8s control plane.
+
+---
+
+## Pattern 3 — Hot Folder (file watcher)
+
+The MAP (or a thin wrapper around it) runs as a **long-lived service** and watches a directory. Orchestrator simply drops files. This is how mercure's **output modules** are wired, and how some PACS-native AI appliances work.
+
+```
+  ┌──────────────────────┐          ┌────────────────────────────┐
+  │ Orchestrator         │          │ Host / NFS filesystem      │
+  │                      │          │                            │
+  │                      │ writes   │  /incoming/<studyUID>/     │
+  │                      │─────────▶│    *.dcm                   │
+  │                      │          │                            │
+  │                      │          │  /done/<studyUID>/         │
+  │                      │          │    seg.dcm                 │
+  │                      │          │    _COMPLETE               │
+  │                      │◀─────────│                            │
+  └──────────────────────┘  poll    └────────────┬───────────────┘
+         ▲                                       │ inotify
+         │ marker file appears                   ▼
+         │                            ┌────────────────────────┐
+         │                            │  MAP Runner (daemon)   │
+         │                            │  watches /incoming,    │
+         │                            │  for each new study:   │
+         │                            │    docker run MAP      │
+         │                            │    move output → /done │
+         │                            │    touch _COMPLETE     │
+         └────────────────────────────┤                        │
+                                      └────────────────────────┘
+```
+
+**How the three signals map:**
+- **Launch:** implicit — a daemon sees a new directory and triggers the MAP.
+- **Data transfer:** shared filesystem (local, NFS, SMB).
+- **Completion:** a **marker file** (`_COMPLETE`, `.done`) or rename of the output directory. The orchestrator polls or uses `inotify`.
+
+Fragile without care — race conditions (reading a half-written file), stuck files on crash, hard to observe. But dead-simple to integrate with legacy systems that only know how to write to shared folders. This is actually how **mercure routes to MAPs in some configurations** and why MAP's filesystem contract exists in the first place.
+
+---
+
+## Pattern 4 — Message Queue + Object Storage (scale-out)
+
+Decouple launch from execution entirely. This is how you run hundreds of concurrent MAPs across a GPU farm and survive worker crashes.
+
+```
+                 ┌─────────────────────┐
+                 │ Orchestrator        │
+                 │                     │
+                 │ 1. PUT DICOM → S3   │
+                 │ 2. enqueue job msg  │
+                 └────┬─────────────┬──┘
+                      │             │
+             ┌────────▼──────┐  ┌───▼──────────────┐
+             │  MinIO / S3   │  │  NATS / RabbitMQ │
+             │  /studies/S1/ │  │  jobs.cxr.v1     │
+             │    *.dcm      │  │  { "in":  "s3://…/S1",
+             │  /results/…   │  │    "map": "rama/lung-seg:1.0.3",
+             └───────┬───────┘  │    "out": "s3://…/R1" }
+                     ▲          └───────┬──────────┘
+                     │                  │ consume
+                     │                  ▼
+                     │         ┌────────────────────┐
+                     │         │  MAP Worker Pool   │
+                     │         │  (N replicas)      │
+                     │         │                    │
+                     │         │  a) pull DICOM     │
+                     │         │  b) docker run MAP │
+                     │         │  c) push result    │
+                     │         │  d) ack + publish  │
+                     │         │     completion msg │
+                     │         └─────────┬──────────┘
+                     │                   │
+                     └───────────────────┘
+                                         │
+                 ┌───────────────────────▼──────┐
+                 │  NATS topic: jobs.done.v1    │
+                 │  { "job_id": "…",            │
+                 │    "status": "ok",           │
+                 │    "out":  "s3://…/R1" }     │
+                 └──────┬───────────────────────┘
+                        │ subscribe
+                        ▼
+                 ┌─────────────────────┐
+                 │ Orchestrator (or    │
+                 │ any downstream      │
+                 │ consumer — FHIR     │
+                 │ emitter, PACS push) │
+                 └─────────────────────┘
+```
+
+**How the three signals map:**
+- **Launch:** message placed on a queue; any free worker claims it.
+- **Data transfer:** object storage (S3/MinIO) via presigned URLs; queue carries only the URI.
+- **Completion:** a completion message on a second topic, or ack-on-success semantics.
+
+This is the "enterprise" pattern. Horizontal scale, survives worker crashes (message re-delivered), natural audit log (queue + object store history), and multiple consumers can react to the same completion event (one writes to PACS, one writes to FHIR, one writes to the PMS dashboard). The cost is infrastructure complexity — you now operate NATS/Kafka and MinIO.
+
+---
+
+## Pattern 5 — DICOMweb Wrapper (clinical-native)
+
+Wrap the MAP in a thin service that speaks **STOW-RS** (store) and **WADO-RS** (retrieve). Now the MAP looks like a PACS node to the orchestrator.
+
+```
+  ┌──────────────────────┐                ┌────────────────────────────┐
+  │ Orchestrator         │                │ MAP-as-DICOMweb wrapper    │
+  │                      │                │ (FastAPI + highdicom)      │
+  │                      │  STOW-RS POST  │                            │
+  │                      │───────────────▶│ /studies (multipart DICOM) │
+  │                      │                │                            │
+  │                      │                │   writes to /var/monai/in  │
+  │                      │                │   docker run MAP (Pattern 1)│
+  │                      │                │   waits for exit           │
+  │                      │                │                            │
+  │                      │   STOW-RS      │                            │
+  │                      │   (callback)   │                            │
+  │                      │◀───────────────│ POSTs seg.dcm to configured │
+  │                      │                │ destination AE / URL        │
+  │                      │                │                            │
+  │                      │  OR  WADO-RS   │                            │
+  │                      │─ GET results ─▶│                            │
+  │                      │◀───────────────│                            │
+  └──────────────────────┘                └────────────────────────────┘
+```
+
+**How the three signals map:**
+- **Launch:** HTTP POST (STOW-RS) — the same protocol hospital systems already speak.
+- **Data transfer:** DICOMweb (HTTP multipart).
+- **Completion:** either synchronous response, a DICOMweb callback push, or the orchestrator polls with QIDO-RS.
+
+Most "clinical-native" option. Any hospital system that knows DICOMweb can drive the MAP. Cost: you need to write and maintain the wrapper; the MAP itself doesn't speak HTTP. **The MONAI Informatics Gateway (MIG) itself can sit as this wrapper** — this is actually its reference role.
+
+---
+
+## Choosing Between Patterns
+
+```
+                      Dev / MVP      Multi-GPU      Scale-out       Clinical
+                      single box     cluster        across nodes    boundary
+                      ─────────      ─────────      ──────────      ────────
+  Docker run            ★★★            ★               —                —
+  K8s Job + PVC          ★              ★★★              ★★               —
+  Hot folder            ★★              ★                ★               ★★
+  Queue + S3            —               ★★               ★★★             ★
+  DICOMweb wrapper      ★               ★★               ★★              ★★★
+
+                      ★★★ = best fit    ★ = possible but awkward
+```
+
+**For the Rama AI Smart Orchestration Platform specifically:**
+
+- **MVP (0–6 months)** — Pattern 1 (`docker run`) driven by mercure. You already have mercure as a recommended component and it drives MAPs natively. You get rule-based routing for free, and you can operate it on a single GPU box while you're ironing out DICOM selection rules and SEG/SR quality issues.
+- **v1.5 (6–18 months)** — Introduce Pattern 4 (queue + MinIO) for the **fan-out case** where one study needs to hit multiple models (e.g., chest X-ray → TB + pneumothorax + cardiomegaly). NATS JetStream pairs well with your PRD's PMS/audit logging requirement because the queue is already an audit trail.
+- **External boundary** — Pattern 5 (DICOMweb wrapper) for how **other hospitals or NHSO partners** talk to your platform. Your internal dispatch stays on Pattern 1 or 4; you only expose DICOMweb at the edge. This is classic hexagonal architecture — filesystem for internal, DICOMweb for external.
+
+The elegant observation from this: **all five patterns agree on the MAP's internal contract** (filesystem in, filesystem out, exit code). That's precisely why MAP survived as a Published Language for the deployment context — it leaves the communication pattern as a choice the platform gets to make later, rather than baking it into the packaging format.
