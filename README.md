@@ -1,3 +1,3 @@
 # MLOps Notes
 
-> My notes on learning MLOps
+>  Notes on learning MLOps.

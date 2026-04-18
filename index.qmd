@@ -1,5 +1,5 @@
 # Preface {.unnumbered}
 
 ::: {.callout-note appearance="default" collapse="false"}
-This is my notes on MLOps Topics
+Notes collection on MLOps Topics
 :::
