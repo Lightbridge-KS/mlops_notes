@@ -100,9 +100,22 @@ Conceptually, DLE answers:
 
 That is especially useful when actual outcomes are delayed but operational awareness is still needed.
 
+```text
+┌──────────────────────┐     ┌──────────────────────┐
+│ Child Model          │     │ Nanny Model         │
+│ (your LVEF regressor)│ ─→  │ predicts loss of    │
+│ predicts y           │     │ child model         │
+└──────────────────────┘     └──────────┬──────────┘
+                                         │
+                              Estimated RMSE / MAE
+                              for live production data
+```
+
+In practice, the nanny model is often implemented with a flexible tabular learner such as **LightGBM**, because predicting the *absolute error* of a model is usually a simpler task than predicting the original clinical target itself.
+
 ---
 
-## 3. Why this matters for medical AI PMS
+## 3. Why this matters for your platform, radiology-specific context
 
 For medical AI, the monitoring problem is rarely just classic software uptime. A model can be technically online, clinically used, and still be deteriorating in a way no one notices yet.
 
@@ -124,9 +137,51 @@ So a hospital AI platform often needs two parallel monitoring layers:
 
 NannyML is strongest in the first layer.
 
+The radiology mapping is straightforward:
+
+| Radiology AI PMS scenario | NannyML contribution |
+|---|---|
+| Chest X-ray pneumonia model, CXR read today and pathology arrives in 3 weeks | **CBPE** for daily estimated AUC without labels |
+| Stroke detection on head CT, MRI confirmation in 24 to 72 hours | **CBPE** for per-shift or per-scanner estimated F1 |
+| Bone age prediction from pediatric hand X-ray, endocrine review later | **DLE** for weekly estimated MAE |
+| Breast density classification with slow consensus and inter-reader variability | **CBPE** for cohort-level estimated accuracy |
+
+This directly matches the PMS need of **continuous monitoring of effectiveness and safety**, even when labels are delayed by days, weeks, or months.
+
 ---
 
-## 4. Current practical scope
+## 4. NannyML's place in the OSS monitoring stack
+
+From the broader monitoring architecture, NannyML is most useful when paired with a complementary monitoring backbone rather than used alone.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ PMS Monitoring Layer                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────────┐        ┌──────────────────────────┐   │
+│  │ Evidently AI     │ ◄────► │ NannyML                  │   │
+│  │ backbone         │        │ performance estimation   │   │
+│  │                  │        │                          │   │
+│  │ • Drift          │        │ • CBPE classification    │   │
+│  │ • Data quality   │        │ • DLE regression         │   │
+│  │ • True perf when │        │ • No-label metrics       │   │
+│  │   labels arrive  │        │                          │   │
+│  └──────────────────┘        └──────────────────────────┘   │
+│                                                             │
+│ Evidently says: distributions shifted.                     │
+│ NannyML says: here is how much that may hurt performance.  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+That pairing is valuable because drift alone is not enough. In production, many shifts are operationally harmless, while a smaller subset causes meaningful degradation. NannyML helps estimate which alerts are likely to matter.
+
+This is also why NannyML stands out in the open-source landscape. It occupies a narrow but important niche: **post-deployment performance estimation in the absence of ground truth**.
+
+---
+
+## 5. Current practical scope
 
 Based on the current NannyML documentation and repository, the library is aimed at **tabular classification and regression** workflows, with core strengths in:
 
@@ -157,7 +212,52 @@ So the right mental model is not "NannyML does all PMS" but rather:
 
 ---
 
-## 5. Practical fit for an AI Smart Orchestration Platform
+## 6. Important caveats, know before you deploy
+
+NannyML is powerful, but it comes with assumptions that matter a lot in healthcare settings.
+
+### 6.1 CBPE depends on calibration
+
+CBPE works best when predicted probabilities are well calibrated. If the model is systematically overconfident or underconfident, the estimated metrics can be misleading.
+
+For medical AI, calibration drift is not a theoretical issue. It can happen after:
+
+- scanner replacement or protocol change
+- site transfer to a new hospital population
+- workflow changes that alter case mix
+- shifts in prevalence over time
+
+So calibration monitoring should be treated as a first-class PMS concern, not an optional extra.
+
+### 6.2 Estimation is not the same as truth
+
+NannyML provides **estimated** performance, not formal realised performance. That makes it valuable as an early-warning layer, but it should not be mistaken for definitive clinical validation.
+
+In practice, estimated performance should later be reconciled against:
+
+- adjudicated expert review
+- pathology or follow-up outcomes
+- delayed reference standards
+- periodic retrospective audit
+
+### 6.3 Scope is strongest for tabular monitoring
+
+NannyML is not a native medical imaging drift framework. It works best when you can express live monitoring through structured features, model outputs, and metadata. For raw image-distribution surveillance, other tools may be more appropriate.
+
+### 6.4 Clinical governance still needs human review
+
+Even a strong no-label monitoring system does not replace governance. If NannyML shows deterioration, the next step is not blind retraining. The next step is structured investigation:
+
+- what changed?
+- where did it change?
+- which scanner, site, protocol, or cohort is affected?
+- is the issue technical, operational, or clinical?
+
+That is why NannyML should sit inside a broader quality-management loop rather than act as a standalone answer.
+
+---
+
+## 7. Practical fit for an AI Smart Orchestration Platform
 
 Within your platform architecture, NannyML is a strong fit for the **post-deployment surveillance** layer, especially when combined with event logging and longitudinal review.
 
@@ -180,7 +280,7 @@ In radiology, this could help answer questions like:
 
 ---
 
-## 6. Strategic takeaway
+## 8. Strategic takeaway
 
 NannyML matters because it focuses on one of the hardest real-world MLOps problems, not just whether data drift exists, but whether model performance is probably changing **before you can prove it with labels**.
 
