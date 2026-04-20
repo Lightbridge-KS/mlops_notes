@@ -216,6 +216,16 @@ So the right mental model is not "NannyML does all PMS" but rather:
 
 NannyML is powerful, but it comes with assumptions that matter a lot in healthcare settings.
 
+A practical summary looks like this:
+
+| Assumption | What it means for radiology AI |
+|---|---|
+| Handles covariate shift | ✅ Works when the input distribution changes, for example after a scanner change or a new patient mix |
+| Does **not** handle concept drift | ⚠️ If **P(Y\|X)** itself changes, for example due to new disease definitions or revised diagnostic criteria, estimates can become misleading |
+| Needs calibrated probabilities for CBPE | ⚠️ Deep-learning CNNs are often overconfident, so recalibration is usually necessary |
+| Needs sufficient chunk size | Small chunks make estimates noisy. In practice, chunk sizes around **5,000 observations** are often a sensible starting point for busy radiology services |
+| CBPE cannot reliably represent truly broken performance below random | ⚠️ If a classifier is catastrophically wrong, CBPE alone may miss the severity. Pair it with drift and data-quality monitoring |
+
 ### 6.1 CBPE depends on calibration
 
 CBPE works best when predicted probabilities are well calibrated. If the model is systematically overconfident or underconfident, the estimated metrics can be misleading.
@@ -257,7 +267,36 @@ That is why NannyML should sit inside a broader quality-management loop rather t
 
 ---
 
-## 7. Practical fit for an AI Smart Orchestration Platform
+## 7. Minimal code example
+
+To make the workflow concrete, the API is intentionally quite scikit-learn-like.
+
+```python
+import nannyml as nml
+
+# 1. Reference = your PIE holdout set, with labels
+# 2. Analysis = live production data, labels not yet available
+
+estimator = nml.CBPE(
+    problem_type='classification_binary',
+    y_pred_proba='pneumonia_probability',
+    y_pred='pneumonia_prediction',
+    y_true='pneumonia_label',  # used on reference data
+    metrics=['roc_auc', 'f1'],
+    chunk_size=5000,
+)
+
+estimator = estimator.fit(reference_df)
+estimated = estimator.estimate(analysis_df)  # no labels needed here
+
+estimated.plot().show()
+```
+
+Operationally, this means you can fit the estimator on a labeled reference set from pre-implementation evaluation, then apply it to production batches and watch the estimated AUC or F1 move over time before labels arrive.
+
+---
+
+## 8. Practical fit for an AI Smart Orchestration Platform
 
 Within your platform architecture, NannyML is a strong fit for the **post-deployment surveillance** layer, especially when combined with event logging and longitudinal review.
 
@@ -280,16 +319,14 @@ In radiology, this could help answer questions like:
 
 ---
 
-## 8. Strategic takeaway
+## 9. Summary, why NannyML earned its spot in the platform
 
-NannyML matters because it focuses on one of the hardest real-world MLOps problems, not just whether data drift exists, but whether model performance is probably changing **before you can prove it with labels**.
+NannyML earns its place because it fills a uniquely important operational gap.
 
-That makes it especially relevant for healthcare AI, where truth is delayed, expensive, partial, or sometimes unavailable.
-
-So for a hospital-oriented MLOps or AI orchestration stack:
-
-- **Evidently** is a strong general monitoring backbone
-- **NannyML** is the key add-on for delayed-ground-truth performance estimation
-- neither replaces formal clinical validation, but together they make PMS much more operationally useful
+1. It fills a real open-source gap. Few tools estimate model performance **without labels** as directly and cleanly.
+2. It uses an **Apache 2.0** license, which is much easier to justify in hospital deployment contexts than AGPL or BSL alternatives.
+3. It directly supports PMS requirements for continuous monitoring, even when labels lag far behind inference.
+4. It pairs naturally with **Evidently**, where Evidently handles broader drift and monitoring workflows while NannyML estimates likely performance impact.
+5. It maps cleanly to the **Robustness** dimension in governance frameworks such as FUTURE-AI.
 
 In short, NannyML is not just another drift tool. It is one of the few OSS components that directly addresses the silent-failure window between deployment and real-world truth.
