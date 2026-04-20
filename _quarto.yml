@@ -39,12 +39,14 @@ book:
       chapters: 
         - text: "Mercure DICOM Orchestrator"
           href: "contents/orchestrator/mercure_dcm_orchestrator.qmd"
+    - part: Post Monitoring Tools
+      chapters: 
+        - text: "NannyML, Post-Deployment ML Monitoring Without Ground Truth"
+          href: "contents/deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd"
     - part: Landscape & Protocols
       chapters: 
         - text: "OSS Landscape for AI Orchestraction"
           href: "contents/deep-research/OSS_Landscape_BuildingBlock_DeepResearch.qmd"
-        - text: "NannyML, Post-Deployment ML Monitoring Without Ground Truth"
-          href: "contents/deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd"
         - text: "PL for Non-LLM models"
           href: "contents/deep-research/RadAI_Published_Languages_Report.qmd"
 
