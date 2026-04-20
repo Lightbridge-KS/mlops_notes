@@ -1,0 +1,195 @@
+---
+title: "NannyML, post-deployment ML monitoring without ground truth"
+---
+
+## TL;DR
+
+NannyML is an open-source Python library (Apache 2.0) that solves a very specific and very painful production ML problem:
+
+> How do I know my model is still performing well when I do not yet have the ground-truth labels to measure it?
+
+For an AI Smart Orchestration Platform, this maps directly to the **post-market surveillance (PMS)** problem. In the OSS landscape, NannyML is uniquely valuable because it focuses on estimating model performance **before labels arrive**.
+
+---
+
+## 1. The core problem, silent model failure
+
+In production radiology AI, there is often a long and uncomfortable gap between inference time and truth availability.
+
+```text
+┌──────────────┐   ┌───────────────┐   ┌──────────────┐
+│ AI inference │ → │ Clinical use  │ → │ Ground truth │
+│ (today)      │   │ (same day)    │   │ (weeks/months) │
+└──────────────┘   └───────────────┘   └──────────────┘
+ t=0                t+hours             t+weeks
+                                         ↑
+                        Pathology, follow-up imaging,
+                        patient outcomes, consensus review
+```
+
+Between **t=0** and **t+weeks**, the model could be silently failing, drifting, misclassifying, or becoming unreliable, while standard metrics such as AUC, sensitivity, specificity, or F1 remain unmeasurable because the labels are not available yet.
+
+NannyML's core value is that it tries to surface this failure mode early, instead of waiting for delayed clinical truth.
+
+---
+
+## 2. How it works, two core algorithms
+
+```text
+┌──────────────────────────────┐
+│ NannyML Core                 │
+└──────────────┬───────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+┌───▼────┐           ┌────▼────┐
+│ CBPE   │           │ DLE     │
+│ Class. │           │ Regr.   │
+└────────┘           └─────────┘
+```
+
+### 2.1 CBPE, Confidence-Based Performance Estimation
+
+CBPE is used for **classification models**, which covers many practical radiology AI tasks such as pneumonia detection, pneumothorax detection, nodule classification, or triage models.
+
+The key idea is simple but powerful:
+
+If a classifier is **well calibrated**, its predicted confidence can be interpreted as the probability that the prediction is correct. That means the confidence score itself contains information about expected performance, even before ground-truth labels arrive.
+
+For example, if a chest X-ray classifier repeatedly outputs probabilities near **0.90**, and calibration is good, then across many such cases the model should be correct roughly 90% of the time. NannyML aggregates this logic over production batches and estimates expected confusion-matrix components, which can then be turned into performance metrics.
+
+```text
+Prediction: "Pneumonia"
+Calibrated probability = 0.90
+
+NannyML reasoning:
+Across many cases with p≈0.90,
+approximately 90% should be correct
+and approximately 10% should be wrong.
+
+↓
+
+Expected TP, FP, TN, FN
+
+↓
+
+Estimated accuracy, precision, recall, F1, ROC AUC
+without needing current labels
+```
+
+This is the feature that makes NannyML unusually relevant for clinical AI. In many hospitals, the true outcome may only emerge after pathology, follow-up imaging, chart review, or multidisciplinary consensus.
+
+**Important requirement:** CBPE depends on probabilities being reasonably calibrated. If the model is overconfident or poorly calibrated, the estimates become less trustworthy. NannyML can help with calibration workflows, but the quality of the underlying probabilities still matters.
+
+### 2.2 DLE, Direct Loss Estimation
+
+DLE is used for **regression models**. This is less central for many radiology classification deployments, but it is still relevant for tasks such as bone-age estimation, ejection fraction prediction, lesion size estimation, or quantitative imaging biomarkers.
+
+The key idea is different from CBPE. Instead of inferring performance from confidence scores, DLE trains a secondary model, sometimes informally thought of as a "nanny model", to predict the expected loss of the deployed model for each observation.
+
+In other words:
+
+- the **child model** makes the original prediction
+- the **nanny model** estimates how wrong that prediction is likely to be
+
+Those estimated losses can then be aggregated over time to approximate production performance metrics such as MAE, MSE, or RMSE before the real targets become available.
+
+Conceptually, DLE answers:
+
+> Given the feature pattern of this case, how much error should I expect from the deployed model?
+
+That is especially useful when actual outcomes are delayed but operational awareness is still needed.
+
+---
+
+## 3. Why this matters for medical AI PMS
+
+For medical AI, the monitoring problem is rarely just classic software uptime. A model can be technically online, clinically used, and still be deteriorating in a way no one notices yet.
+
+NannyML addresses a very practical PMS question:
+
+> Can we estimate whether model performance is slipping before formal outcome labels are available?
+
+That matters because delayed truth is normal in healthcare:
+
+- pathology reports arrive later
+- follow-up imaging may take weeks or months
+- consensus review is slow and expensive
+- adjudicated labels may never exist for every case
+
+So a hospital AI platform often needs two parallel monitoring layers:
+
+1. **Immediate proxy surveillance**, based on drift, calibration, and estimated performance
+2. **Deferred true performance review**, once labels or expert review finally arrive
+
+NannyML is strongest in the first layer.
+
+---
+
+## 4. Current practical scope
+
+Based on the current NannyML documentation and repository, the library is aimed at **tabular classification and regression** workflows, with core strengths in:
+
+- performance estimation without targets
+- drift detection, both univariate and multivariate
+- data quality checks such as missing or unseen categorical values
+- linking drift alerts back to likely performance impact
+
+This is important for radiology architecture decisions.
+
+NannyML is **not** a full native medical-image monitoring stack by itself. It is best understood as a monitoring layer for:
+
+- model outputs
+- metadata
+- structured features
+- downstream tabular representations
+- delayed-label performance estimation
+
+For image-heavy medical AI systems, it pairs well with complementary tools:
+
+- **Evidently** for broader monitoring dashboards and test-style workflows
+- **Alibi Detect** or similar tools for image-oriented drift methods
+- local clinical audit pipelines for eventual real-world outcome review
+
+So the right mental model is not "NannyML does all PMS" but rather:
+
+> NannyML fills the delayed-ground-truth gap inside a larger monitoring architecture.
+
+---
+
+## 5. Practical fit for an AI Smart Orchestration Platform
+
+Within your platform architecture, NannyML is a strong fit for the **post-deployment surveillance** layer, especially when combined with event logging and longitudinal review.
+
+A practical pattern would be:
+
+- inference service emits prediction, score, model version, site, device, and study metadata
+- production batches are chunked over time
+- NannyML estimates expected performance trends from the incoming stream
+- drift alerts are correlated with estimated performance degradation
+- a later audit layer replaces estimated performance with realised performance once labels arrive
+
+That gives you an early-warning system rather than a retrospective-only system.
+
+In radiology, this could help answer questions like:
+
+- Has site A started feeding data that is distributionally different from the reference hospital?
+- Is a model still likely performing acceptably after a scanner upgrade?
+- Did a workflow change alter case mix enough to threaten calibration?
+- Are performance alerts likely to be clinically meaningful, or only benign data drift?
+
+---
+
+## 6. Strategic takeaway
+
+NannyML matters because it focuses on one of the hardest real-world MLOps problems, not just whether data drift exists, but whether model performance is probably changing **before you can prove it with labels**.
+
+That makes it especially relevant for healthcare AI, where truth is delayed, expensive, partial, or sometimes unavailable.
+
+So for a hospital-oriented MLOps or AI orchestration stack:
+
+- **Evidently** is a strong general monitoring backbone
+- **NannyML** is the key add-on for delayed-ground-truth performance estimation
+- neither replaces formal clinical validation, but together they make PMS much more operationally useful
+
+In short, NannyML is not just another drift tool. It is one of the few OSS components that directly addresses the silent-failure window between deployment and real-world truth.
