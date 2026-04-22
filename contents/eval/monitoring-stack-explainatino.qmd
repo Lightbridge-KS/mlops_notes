@@ -1,0 +1,191 @@
+---
+title: "AI Monitoring Stack — Layer Explanations"
+---
+
+
+This 7-layer monitoring stack is essentially the **PMS (Post-Market Surveillance)** sensing system for your orchestration platform. Each layer answers a different question about "is the AI still trustworthy?" — and critically, they detect problems at **different latencies**, which is why the alert windows differ so much.
+
+Let me first show the mental model, then walk through each layer.
+
+## The Big Picture: A Funnel from Fast to Slow Truth
+
+```
+                   UPSTREAM (fast signals, cheap)
+                           │
+    ┌──────────────────────▼───────────────────────────────┐
+    │  1. Input drift        ← data coming in              │
+    │  2. Embedding drift    ← model's internal view       │
+    │  3. Prediction drift   ← model's output              │
+    │  4. Performance (est.) ← inferred accuracy           │
+    │  5. Performance (true) ← measured accuracy           │
+    │  6. Fairness           ← equity across groups        │
+    │  7. Consensus          ← agreement with radiologists │
+    └──────────────────────┬───────────────────────────────┘
+                           ▼
+                   DOWNSTREAM (slow signals, costly, but closer to clinical truth)
+```
+
+Think of it this way: layer 1 answers *"has the world changed?"*, layer 7 answers *"do humans still agree with the AI?"*. Between them lies a chain of increasingly direct, but increasingly delayed, evidence of model health.
+
+---
+
+## Layer 1 — Input Drift
+
+**Question:** *"Is the data entering the AI different from what it was trained on?"*
+
+This is the **earliest warning signal**. Before the model even runs, you compare the statistical distribution of incoming study inputs against a reference (usually the training or PIE-validation distribution).
+
+**Methods in your table:**
+- **PSI (Population Stability Index)** — numeric features (e.g., patient age, tube voltage, pixel intensity histograms)
+- **KS (Kolmogorov–Smirnov test)** — continuous distributions
+- **Chi-square** — categorical features (modality, body part, manufacturer)
+
+**Radiology example:** A new CT scanner is installed in the ED. Its noise profile and HU distribution differ from the original training data → PSI for pixel intensity histogram spikes → alert within 1 hour.
+
+**Why 1-hour alert:** Input drift is cheap to compute (pure statistics on incoming data), actionable quickly, and is the "canary in the coal mine" — catching it early prevents garbage-in garbage-out downstream.
+
+---
+
+## Layer 2 — Embedding Drift
+
+**Question:** *"Is the model 'seeing' images differently, even if the raw pixels look similar?"*
+
+Raw pixel statistics (Layer 1) can miss subtle semantic shifts. Embedding drift catches these by extracting the model's internal feature vector (or using a separate pretrained encoder like CLIP/RadCLIP) and measuring how far the new images sit from the reference cluster in embedding space.
+
+**Method:** **Cosine distance** between the centroid of recent embeddings and the reference centroid (or per-sample distance distributions).
+
+```
+Reference cluster         New data drifting away
+   (training era)              (last 24 hr)
+      ┌───────┐                       ╲
+      │  ● ● ● │       cosine distance  ╲
+      │● ●●●  ●│  ──────────────────────► ▲ ▲
+      │ ● ● ● ●│           increasing    ▲ ▲ ▲
+      └───────┘                         ▲ ▲
+```
+
+**Radiology example:** New contrast protocol → pixels look statistically similar (Layer 1 silent), but the chest CT embeddings cluster differently → Layer 2 catches it.
+
+**Why 24-hour alert:** Embedding extraction is GPU-expensive, needs a meaningful sample size, and embedding drift is usually a *gradual* phenomenon — not an emergency.
+
+---
+
+## Layer 3 — Prediction Drift
+
+**Question:** *"Is the model's output distribution changing?"*
+
+Instead of looking at inputs, this layer monitors outputs: class probabilities, prediction counts, confidence score distributions.
+
+**Methods in your table:**
+- **Distribution monitoring** — e.g., is the "pneumonia positive" rate suddenly 30% when it used to be 8%?
+- **Confidence monitoring** — is the mean softmax confidence dropping? Are more predictions falling in the "uncertain" zone?
+
+**Radiology example:** A chest X-ray AI that normally flags 5% of studies as "abnormal" suddenly flags 18% → within 15 minutes, Grafana dashboards alert the on-call engineer.
+
+**Why 15-min alert (the fastest):** Prometheus+Grafana are *already running* for infrastructure monitoring — adding prediction metrics is almost free. This layer is the most **operationally actionable** in real-time: a sudden shift means either a data pipeline broke or the model is being fed garbage.
+
+---
+
+## Layer 4 — Performance (No Label)
+
+**Question:** *"Is the model's accuracy dropping, even though we don't yet have ground truth?"*
+
+This is the cleverest layer. In medicine, ground truth (final diagnosis, follow-up imaging, pathology) often arrives **weeks or months later**. NannyML estimates performance *before* labels exist, using:
+
+- **CBPE (Confidence-Based Performance Estimation)** — uses the model's own calibrated confidences to estimate precision/recall
+- **DLE (Direct Loss Estimation)** — trains a secondary regressor to predict the loss of each prediction
+
+```
+Traditional monitoring:     Wait for labels ───► measure accuracy
+                                   (weeks)
+
+NannyML approach:            Use confidences ───► ESTIMATE accuracy
+                                   (days)            NOW
+```
+
+**Radiology example:** Your intracranial hemorrhage detector. Final neurosurgical/discharge diagnosis may take 1–2 weeks. NannyML gives you a warning in 1–3 days that estimated sensitivity has dropped from 94% to 87%.
+
+**Why 1–3 day alert:** Needs enough inference volume to produce stable estimates, but doesn't wait for clinical ground truth. This is the **bridge layer** between fast drift signals and slow outcome signals.
+
+---
+
+## Layer 5 — Performance (With Label)
+
+**Question:** *"What is the model's actual, measured clinical accuracy?"*
+
+This is the **gold-standard** layer — the one regulators, ethics committees, and journal reviewers care about most.
+
+**Methods:**
+- **Sensitivity** (recall) — did we catch the abnormal cases?
+- **AUROC** — overall discrimination
+- **PPV** — when the AI says positive, how often is it right? (clinically critical)
+
+**Radiology example:** Monthly PMS report comparing AI predictions to final radiologist-confirmed reads, pathology, and clinical follow-up for the month's cohort.
+
+**Why 7–30 day alert:** Ground truth accumulation is slow. Pathology takes days to weeks; clinical follow-up imaging may take a month. You can't compute it faster than the workflow allows.
+
+This is the **slowest but most trusted** signal — which is why you need layers 1–4 to not be blind during this waiting period.
+
+---
+
+## Layer 6 — Fairness
+
+**Question:** *"Is the model performing equally well across demographic groups?"*
+
+Even a model with 92% overall AUROC may be 96% on one group and 84% on another. Fairness monitoring looks for **disparate performance**.
+
+**Methods in your table:**
+- **Demographic parity** — are positive prediction rates similar across groups (sex, age band, insurance type, hospital site)?
+- **Equalized Odds (EqOdds)** — are TPR and FPR similar across groups?
+
+**Radiology example:** Your breast density classifier works beautifully overall, but EqOdds audit reveals FPR is 2× higher in patients ≥70 years old → fairness alert → clinical investigation.
+
+**Why 7-day alert:** Fairness requires accumulating enough cases *per subgroup* for statistical validity. Weekly cadence aligns with most hospital audit rhythms and with FUTURE-AI's Fairness principle.
+
+---
+
+## Layer 7 — Consensus (Discordance Rate)
+
+**Question:** *"How often do radiologists disagree with the AI?"*
+
+This is unique because it measures **human–AI agreement** in real workflow. Every time a radiologist's final report contradicts the AI's prediction, that's a discordance event.
+
+**Method:** **Discordance rate** = (# AI-radiologist disagreements) / (# cases reviewed)
+
+```
+AI says:           POSITIVE    POSITIVE    NEGATIVE    NEGATIVE
+Radiologist:       POSITIVE    NEGATIVE    POSITIVE    NEGATIVE
+                   agree       DISCORD     DISCORD     agree
+                               (FP?)       (FN?)
+```
+
+**Radiology example:** Pulmonary nodule AI suddenly shows rising discordance — radiologists dismissing 40% of AI flags as "not a nodule" (previously 15%). Could mean: model regressed, workflow changed, or certain reporting radiologist pattern changed.
+
+**Why 1-hour alert:** This runs on *real-time report parsing* — once you have NLP that extracts radiologist conclusions, discordance can be computed nearly immediately, case by case. It's the **earliest clinical-truth-adjacent** signal you have.
+
+This layer also feeds your **Continual Learning** loop: disagreements are the highest-value training examples.
+
+---
+
+## Putting It All Together: Why Multiple Layers?
+
+The layers form a **temporal defense-in-depth**:
+
+```
+ Latency │
+   15min │  ■ Layer 3: Prediction drift (fast ops signal)
+    1 hr │  ■ Layer 1: Input drift       ■ Layer 7: Consensus
+   24 hr │  ■ Layer 2: Embedding drift
+  1-3 d  │  ■ Layer 4: NannyML est. perf
+    7 d  │  ■ Layer 6: Fairness
+ 7-30 d  │  ■ Layer 5: True performance
+         └──────────────────────────────────────────────►
+                                               Trustworthiness
+                                             (closer to ground truth)
+```
+
+- **Fast layers (1, 3, 7)** → detect problems in hours, trigger operational response
+- **Medium layers (2, 4, 6)** → detect subtle drift and equity issues within days
+- **Slow layer (5)** → provides the definitive truth for regulatory reporting
+
+No single layer is sufficient. Input drift without performance monitoring tells you the weather changed but not whether you got wet. Performance monitoring without input drift tells you that you're wet but not why. The stack is designed so that **by the time the slow, expensive signals arrive, you've already had multiple chances to catch the problem via cheaper, faster proxies**.
