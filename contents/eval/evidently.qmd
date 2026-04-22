@@ -1,0 +1,157 @@
+---
+title: "Evidently AI — What, Shape, and Fit for the Orchestration Platform"
+---
+
+## 1. What is Evidently AI?
+
+Evidently AI is an **open-source ML/LLM observability framework** — a Python-first toolkit that helps you *evaluate, test, and monitor* AI systems across the full lifecycle: from experiments → pre-deployment validation → production monitoring.
+
+At its core, it provides a uniform way to answer three recurring questions that any serious ML system has to answer continuously:
+
+```
+   ┌───────────────────────────────────────────────────────────┐
+   │  Evidently's three core questions                         │
+   ├───────────────────────────────────────────────────────────┤
+   │  1. Is my data OK?          → data quality + drift        │
+   │  2. Is my model OK?         → performance + bias          │
+   │  3. Will I notice if not?   → tests + alerts + dashboards │
+   └───────────────────────────────────────────────────────────┘
+```
+
+It ships with **100+ built-in metrics** covering drift detection (PSI, KS, Wasserstein, Jensen–Shannon), classification/regression/ranking performance, data quality checks, and — more recently — LLM evaluation (hallucination, toxicity, RAG quality). Apache 2.0 license on the library.
+
+The governing philosophy is *"reports → tests → monitoring"*: the same metric definitions graduate from a one-off investigation, to a CI/CD gate, to a continuous surveillance feed. That's a clean separation of concerns your engineering mind will appreciate.
+
+---
+
+## 2. The "Shape" — It's a Stack, Not a Single Thing
+
+This is where people often get confused. Evidently is **not one product — it's four offerings along a spectrum**:
+
+```
+             OPEN SOURCE                  │         COMMERCIAL
+  ───────────────────────────────────────────────────────────────────
+                                          │
+  ┌──────────────────┐  ┌──────────────┐  │  ┌─────────────────────┐
+  │ evidently        │  │ Evidently UI │  │  │ Evidently Cloud     │
+  │ (Python library) │  │ (OSS server) │  │  │ (managed SaaS)      │
+  │                  │  │              │  │  │                     │
+  │ • 100+ metrics   │  │ • Dashboard  │  │  │ • Collab workspace  │
+  │ • Reports        │  │ • Projects   │  │  │ • Alerting, RBAC    │
+  │ • Test Suites    │  │ • Stores     │  │  │ • No-code evals     │
+  │ • HTML/JSON out  │  │   results    │  │  │ • Hosted infra      │
+  └──────────────────┘  └──────────────┘  │  └─────────────────────┘
+         │                     ▲          │           ▲
+         │                     │          │           │
+         └────── feeds ────────┘          │  ┌────────┴──────────────┐
+                                          │  │ Evidently Enterprise. │
+  ┌──────────────────┐                    │  │ (self-hosted)         │
+  │ tracely          │                    │  │                       │
+  │ (OSS, OTel-based)│                    │  │ • On-prem / VPC       │
+  │ • LLM tracing    │                    │  │ • Full feature set    │
+  └──────────────────┘                    │  │ • Regulated industries│
+                                          │  └───────────────────────┘
+  Apache 2.0                              │  Commercial license
+```
+
+Concretely, the **shapes** are:
+
+- **`evidently` (library)** — `pip install evidently`. A Python package you import into notebooks, pipelines, or services. This is the workhorse — it computes metrics, generates HTML/JSON reports, and defines test suites. Most of the PRD-relevant value lives here.
+- **Evidently UI (OSS dashboard)** — a lightweight self-hosted web app included in the library. `evidently ui` launches a local dashboard that stores and visualizes reports over time. Apache 2.0. **This is what you'd deploy inside the hospital.**
+- **`tracely` (OSS library)** — a companion library built on OpenTelemetry for capturing live traces from AI apps (mostly LLM workflows). Also Apache 2.0.
+- **Evidently Cloud / Enterprise** — commercial layers adding collaboration, RBAC, alerting, no-code UI, and managed infrastructure. **Not relevant for your on-prem hospital deployment** unless you decide to adopt a private cloud edition later.
+
+For the Radiology AI Unit platform, the realistic adoption path is:
+
+```
+   Library (evidently) + OSS Dashboard (Evidently UI)
+           │                         │
+           ▼                         ▼
+   PIE pipelines                PMS monitoring
+   (CI/CD gates)                (live dashboard)
+```
+
+No licensing trap, no vendor lock-in, fully self-hostable.
+
+---
+
+## 3. What Problems Does It Solve for Your Orchestration Platform?
+
+The Orchestration Platform PRD has two giant evaluation needs — **PIE** (pre-installation) and **PMS** (post-market surveillance) — plus the Traceability principle of FUTURE-AI. Evidently addresses a specific, clearly-scoped subset of these. Here's the map:
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │              AI Smart Orchestration Platform                     │
+  │                                                                  │
+  │  ┌─────────────────┐     ┌─────────────────┐                     │
+  │  │  PIE Pipeline   │     │  PMS Monitoring │                     │
+  │  │  (pre-install)  │     │  (post-deploy)  │                     │
+  │  └────────┬────────┘     └────────┬────────┘                     │
+  │           │                       │                              │
+  │           │  ┌──────────────────┐ │                              │
+  │           └──► Evidently Test   ◄─┘                              │
+  │              │ Suites (pass/fail)│                               │
+  │              └─────────┬────────┘                                │
+  │                        │                                         │
+  │                        ▼                                         │
+  │              ┌──────────────────┐                                │
+  │              │ Evidently UI     │  ◄── queried by Clinician UX   │
+  │              │ (dashboard)      │       / Grafana / alerting     │
+  │              └──────────────────┘                                │
+  │                        │                                         │
+  │                        ▼                                         │
+  │              ┌──────────────────┐                                │
+  │              │ JSON/HTML Reports│  ◄── Traceability artifacts    │
+  │              │ (versioned)      │      (audit log, ISO 13485)    │
+  │              └──────────────────┘                                │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+Concretely, the problems it solves:
+
+**Problem A — Inconsistent, ad-hoc PIE evaluation.** The PRD describes PIE as an "evaluation before installation with Go/No-Go criteria." Right now, teams reinvent this per model. Evidently's `Test Suite` primitive turns a Go/No-Go checklist into executable code. You declare thresholds (`accuracy > 0.85`, `ks_test_pvalue > 0.05`, `missing_values < 1%`), run them against a validation dataset, and get a pass/fail report — usable as a CI/CD gate on your AI Model Registry.
+
+**Problem B — No continuous monitoring for drift.** Your Fund document (Thai) explicitly calls out *"ความแม่นยำของ AI ลดลงอย่างเงียบๆ"* — silent degradation due to device upgrades, workflow changes, patient population shifts. Evidently's drift metrics (PSI, KS, Wasserstein, JSD) on input features and prediction distributions directly address this. Paired with a scheduled job, you get the "real-time monitoring" called for in PMS section 2.3.1.
+
+**Problem C — No traceable evidence of model behavior over time.** FUTURE-AI's Traceability principle requires documented, auditable evidence of what each model did, on what data, when. Every Evidently run produces a versioned JSON/HTML artifact. Those become your audit trail — perfectly aligned with ISO 13485 traceability and the PRD's FR-25 and FR-29.
+
+**Problem D — Bridging PIE → PMS with the same metric definitions.** This is the quietly elegant part. A Test Suite you use as a pre-deployment gate can be *re-run on production batches* as a monitoring job, because the metric definitions are identical. You don't have two disconnected evaluation systems — PIE and PMS speak the same language.
+
+**Problem E — Ground-truth-delayed evaluation (partial).** Evidently handles proxy metrics (drift, data quality) that don't require labels. For the deeper case — *estimating* performance when ground truth is weeks away (common in radiology where final pathology reports lag) — you'd pair Evidently with **NannyML**. Evidently alone doesn't solve this.
+
+---
+
+## 4. Where Evidently *Doesn't* Fit — An Honest Caveat
+
+This matters for a radiology platform: **Evidently is tabular/text-first**. Its metric library assumes rows of features and predictions. For monitoring raw DICOM pixel drift (e.g., CT scanner manufacturer changes affecting Hounsfield distributions), Evidently is not the right tool out of the box.
+
+```
+   Evidently strong fit           Evidently weak fit
+   ────────────────────           ──────────────────
+   • Tabular features     vs.     • Raw pixel drift (images)
+   • Prediction scores            • Deep feature-space drift
+   • Classification output        • MRI/CT distribution shifts
+   • Demographic bias slices      • Segmentation mask drift
+   • Report text / LLM output
+```
+
+For radiology imaging specifically, Evidently works well on:
+- Model output drift (e.g., "fraction of positive findings over time")
+- Tabular metadata drift (patient age, sex, scanner model, slice thickness)
+- Demographic performance slicing
+- Report-level NLP quality (if you layer in LLM-generated reports)
+
+For raw image drift, you'd pair it with **Alibi Detect** (BSL license caveat) or a custom embedding-based drift detector on a published-language representation from your `RadAI_Published_Languages_Report` work. That's actually a natural architectural seam: the Published Language (structured findings) is *exactly* the tabular representation Evidently thrives on — so the two strategies compose cleanly.
+
+---
+
+## Summary
+
+| Dimension | Answer |
+|---|---|
+| **What** | Open-source ML/LLM observability framework; 100+ metrics for drift, performance, quality |
+| **Shape** | Python library (core) + OSS self-hosted dashboard + optional commercial Cloud/Enterprise |
+| **License for your use** | Apache 2.0 — clean, no restrictions for hospital deployment |
+| **Fits which PRD pieces** | PIE (test suites as Go/No-Go gates), PMS (drift + performance monitoring), Traceability (versioned reports) |
+| **Doesn't fit** | Raw medical image drift — needs pairing with Alibi Detect or custom embedding drift on your Published Language |
+| **Best paired with** | NannyML (ground-truth-free perf estimation), MLflow (registry lineage), Alibi Detect (image drift) |
