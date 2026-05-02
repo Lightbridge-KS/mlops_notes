@@ -1,0 +1,210 @@
+---
+title: "Evidently — A Rundown for AiSmartOps"
+---
+
+## 1. What Evidently is, in one paragraph
+
+Evidently is an open-source Python framework for evaluating, testing, and monitoring ML/LLM systems (Apache 2.0, ~6.4k+ stars, very actively maintained — current version is 0.7.x). It ships 100+ built-in metrics for data drift, data quality, and model performance, plus a self-hostable monitoring UI. It is deliberately modular: you can use it as a one-off Python library, as a CI/CD gate, or as a full monitoring service — without committing to any of those tiers up front.
+
+## 2. The three-layer mental model
+
+This is the most important thing to internalize. Evidently has one input pattern (a Dataset) and three escalating output modes:
+
+```text
+ ┌──────────────────────────────────┐
+ │ INPUT: Pandas DataFrame(s)       │
+ │ ─ current_data (required)        │
+ │ ─ reference_data (optional,      │
+ │   usually training/baseline)     │
+ └─────────────┬────────────────────┘
+               │
+ ┌─────────────┼──────────────────────────┐
+ ▼             ▼                          ▼
+ ┌───────────┐ ┌───────────┐ ┌──────────────┐
+ │ REPORT    │ │ TEST SUITE│ │ MONITORING   │
+ │ raw       │ │ pass/fail │ │ DASHBOARD    │
+ │ metrics   │ │ over time │ │ time-series  │
+ │ (HTML/    │ │ Report    │ │ panels +     │
+ │ JSON)     │ │           │ │ alerts       │
+ └───────────┘ └───────────┘ └──────────────┘
+ "describe"   "validate"    "surveil"
+
+ Best for:    Best for:       Best for:
+ ─ EDA        ─ CI/CD gates   ─ Production PMS
+ ─ Debugging  ─ Pre-deploy    ─ Trend tracking
+ ─ Model      checks          ─ Alerting
+   cards      ─ Regression
+                tests
+```
+
+A Report is a snapshot (“here are 30 metrics”). Add pass/fail thresholds and the same Report becomes a Test Suite (“did each metric stay inside its bound?”). Snapshots persisted as JSON over time become a Monitoring Dashboard. One mental model, three deployment intensities.
+
+## 3. The metric catalog (what you actually get)
+
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│ DATA DRIFT             │ Per-column statistical tests              │
+│                        │ Numerical: KS, Wasserstein, PSI           │
+│                        │ Categorical: Chi², Jensen-Shannon, PSI    │
+│                        │ Text/embed: embedding drift, MMD-lite     │
+├────────────────────────┼───────────────────────────────────────────┤
+│ DATA QUALITY           │ Missing %, duplicates, range violations,  │
+│                        │ new categories, correlations, cardinality │
+├────────────────────────┼───────────────────────────────────────────┤
+│ MODEL PERFORMANCE      │ Classification: AUC, F1, precision/recall │
+│                        │ confusion matrix, calibration curves      │
+│                        │ Regression: MAE, MAPE, error bias         │
+│                        │ Ranking/RecSys: NDCG, MAP, hit rate      │
+├────────────────────────┼───────────────────────────────────────────┤
+│ TARGET / PREDICTION    │ Drift in y_true and y_pred distributions  │
+│ DRIFT                  │ (works even before ground truth arrives)  │
+├────────────────────────┼───────────────────────────────────────────┤
+│ TEXT / LLM             │ Length, sentiment, toxicity, regex match, │
+│                        │ semantic similarity, LLM-as-judge         │
+└────────────────────────┴───────────────────────────────────────────┘
+```
+
+## 4. Why the OSS report calls it your “monitoring backbone”
+
+Looking at your `OSS_Landscape_BuildingBlock_DeepResearch.md`, Evidently is the only single tool that scores well on all four of these criteria simultaneously: (a) Apache 2.0 (no AGPL/BSL/SSPL footguns), (b) covers both PIE and PMS, (c) self-hostable on hospital infrastructure, and (d) modular enough that you adopt incrementally. Deepchecks is AGPL, Alibi Detect went BSL, NannyML covers a narrower slice, whylogs is profiling-only. Evidently sits at the intersection.
+
+## 5. How Evidently maps to your PIE → PMS lifecycle
+
+This is the part that matters most for AiSmartOps. The Evidently Report → TestSuite → Dashboard pipeline is isomorphic to your PIE → Go/No-Go → PMS workflow:
+
+```text
+ PIE PHASE                 GO/NO-GO              PMS PHASE
+ (Pre-Implementation       DECISION GATE         (Post-Market
+ Evaluation)                                     Surveillance)
+ ──────────────────        ──────────────        ──────────────
+
+ ┌───────────────────┐     ┌───────────────┐     ┌────────────────┐
+ │ Vendor's hospital │     │ All test      │     │ Live inference │
+ │ silent-run output │     │ conditions    │ YES │ logs (daily    │
+ │ on local data     │     │ pass on local │ ───►│ batches)       │
+ │ + reference set   │     │ validation    │     │                │
+ │                   │     │ dataset?      │     │                │
+ └─────────┬─────────┘     └───────────────┘     └────────┬───────┘
+           │                       ▲                       │
+           ▼                       │                       ▼
+ ┌───────────────────┐     ┌───────────────┐     ┌────────────────┐
+ │ Evidently         │     │ Evidently     │     │ Evidently      │
+ │ Test Suite        │────►│ pass/fail     │     │ snapshots →    │
+ │                   │     │ summary       │     │ Monitoring UI  │
+ │ ─ Data quality    │     │ (audit-       │     │                │
+ │ ─ Data drift vs   │     │ loggable      │     │ ─ Daily drift  │
+ │   training set    │     │ artifact)     │     │ ─ Perf trend   │
+ │ ─ Performance vs  │     └───────────────┘     │ ─ Alert rules  │
+ │   threshold       │                           │ ─ Bias audit   │
+ │ ─ Subgroup parity │                           └────────┬───────┘
+ └───────────────────┘                                    │
+                                                          ▼
+                                                ┌────────────────┐
+                                                │ Alert → Re-PIE │
+                                                │ on drift > X   │
+                                                └────────────────┘
+```
+
+The key architectural payoff: the same metric definitions flow through both phases. A threshold you proved acceptable in PIE becomes the alert boundary in PMS automatically — no rewriting, no two parallel evaluation codebases. This is exactly the auditability story your funding proposal needs for ISO 13485 / IEC 62304 / ISO/IEC 42001 compliance.
+
+## 6. Where Evidently slots into the AiSmartOps stack
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                  AI SMART ORCHESTRATION PLATFORM                    │
+│                                                                     │
+│ ┌────────────────┐ ┌────────────────┐ ┌─────────────────┐          │
+│ │ INGESTION      │►│ ORCHESTRATION  │►│ INFERENCE       │          │
+│ │ MONAI Inform.  │ │ MONAI Workflow │ │ Triton/KServe   │          │
+│ │ Gateway, FHIR  │ │ Manager        │ │                 │          │
+│ └────────────────┘ └────────┬───────┘ └────────┬────────┘          │
+│                             │                  │                   │
+│                             ▼                  ▼                   │
+│              ┌──────────────────────────────────┐                  │
+│              │ FEATURE EXTRACTION ADAPTER       │                  │
+│              │ (lifts model output to a         │                  │
+│              │ tabular schema Evidently         │                  │
+│              │ can read — see §7)               │                  │
+│              └────────────────┬─────────────────┘                  │
+│                               │                                    │
+│                               ▼                                    │
+│     ┌─────────────────────────────────────────────────┐            │
+│     │                 ◄◄◄ EVIDENTLY ►►►               │            │
+│     │                                                 │            │
+│     │ PIE Test Suite (pre-deploy gate)                │            │
+│     │ PMS Monitoring Dashboard (live)                 │            │
+│     │                                                 │            │
+│     │ Self-hosted on hospital VM/K8s,                 │            │
+│     │ data never leaves the firewall.                 │            │
+│     └────┬────────────────────────────────────────┬───┘            │
+│          │                                        │                │
+│          ▼                                        ▼                │
+│ ┌────────────────┐                      ┌────────────────┐        │
+│ │ MLflow         │                      │ Grafana /      │        │
+│ │ (registry +    │                      │ OHIF Viewer    │        │
+│ │ lineage)       │                      │ (clinician)    │        │
+│ └────────────────┘                      └────────────────┘        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 7. The radiology-specific caveat (this is the important one)
+
+Evidently is tabular-first by design. It will not compute pixel-level drift on a CT volume the way Alibi Detect’s MMD-on-deep-features will. For a radiology orchestration platform, this means you cannot just hand Evidently a folder of DICOMs.
+
+What you do instead — and what makes Evidently still the right backbone — is build a feature-extraction adapter that lifts each inference event into a flat row:
+
+```text
+Per-inference row (one row per study):
+┌──────────────────────────────────────────────────────────────────────┐
+│ Metadata: modality, body_part, manufacturer, kvp,                    │
+│ slice_thickness, station_name, scanner_model                         │
+│ Demographics: age_bin, sex, weight_bin (if available)                │
+│ Image stats: mean_intensity, std, mean_HU_lung, snr_estimate         │
+│ Model output: predicted_class, top_k_probabilities, max_logit,       │
+│ bbox_count, segmentation_volume_ml                                   │
+│ Operational: latency_ms, gpu_util, model_version                     │
+│ Ground truth: radiologist_label (delayed; arrives later)             │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Evidently then monitors drift on this derived schema, which is exactly what FDA-style PMS asks for: “is the input distribution the model is seeing today the same as the distribution it was validated on?” You watch scanner-model drift, intensity-stat drift, prediction-confidence drift, latency drift — all at the orchestrator level, model-agnostic.
+
+This dovetails directly with your `RadAI_Published_Languages_Report.md` insight: because there is no Published Language for radiology AI inference outputs, your platform must define one locally. The Evidently-row schema above effectively becomes that internal published language — a stable tabular contract that every radiology model adapter must produce, regardless of whether the upstream model is a YOLO box-tensor, a SAM mask, or a SR-style classifier. This is a meaningful architectural win, not just plumbing.
+
+## 8. What Evidently does not solve (so you know the gaps)
+
+```text
+NOT covered by Evidently                  → Pair with
+────────────────────────────────────────────────────────────────────
+Pixel-level image drift                   Alibi Detect (BSL — eval license)
+Perf estimation w/o ground truth          NannyML (the canonical pairing)
+Privacy-preserving profiling              whylogs (no raw data leaves site)
+Comprehensive fairness suite              AIF360 + Fairlearn
+Pre-deploy adversarial scan               Giskard
+DICOM-native rendering                    OHIF / Cornerstone3D
+```
+
+The OSS report’s headline pairing — Evidently + NannyML — exists for one specific reason: in radiology, ground truth arrives weeks-to-months late (follow-up imaging, biopsy, clinical outcome). Evidently tells you the inputs drifted; NannyML estimates whether that drift hurt your AUC before the labels return. Together they cover the full FUTURE-AI Robustness principle.
+
+## 9. Minimal hello-world (so the API isn’t abstract)
+
+```python
+import pandas as pd
+from evidently import Report
+from evidently.presets import DataDriftPreset, ClassificationPreset
+
+# reference = silent-run / training distribution
+# current = last 7 days of production inferences
+report = Report(metrics=[
+    DataDriftPreset(),
+    ClassificationPreset(),
+])
+
+snapshot = report.run(reference_data=ref_df, current_data=prod_df)
+snapshot.save_html("pms_week_2026_w17.html")  # for radiologists
+snapshot.save_json("pms_week_2026_w17.json")  # for the dashboard
+```
+
+To turn this into a PIE gate, you add Tests (e.g. `gt`, `lt`, `eq`) and the same object emits a pass/fail summary CI can block on. Same code, two roles.
+
+Bottom line for AiSmartOps: adopt Evidently as the evaluation kernel of OBJ-2 (PIE + PMS), wrap it with a thin radiology feature-extraction adapter that becomes your platform’s internal published language, and reserve Alibi Detect / NannyML / whylogs for the gaps Evidently leaves open. The Apache 2.0 license, self-hostability, and identical metric definitions across PIE and PMS are what make it a defensible, audit-friendly choice — not just a popular one.
