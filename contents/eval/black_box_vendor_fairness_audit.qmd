@@ -1,0 +1,193 @@
+---
+title: "Fairness Auditing for Vendor-Locked Black-Box Models"
+---
+
+This chapter follows from the [AI Fairness Suite chapter](fairness_suite_aif360_fairlearn.qmd): can Fairlearn and AIF360 still be useful when the model is vendor-locked and inference-only?
+
+Short answer: yes. Both toolkits support black-box / inference-only auditing. The measurement layer works especially well because it only needs model outputs, ground truth, and sensitive attributes. Mitigation is possible too, but mostly limited to post-processing.
+
+## 1. Fairlearn in the black-box setting
+
+Yes — and this is actually one of Fairlearn’s sweet spots. Most of its measurement layer is fully model-agnostic, and even part of its mitigation layer can work without model access.
+
+### What you can do with just `(X, y_true, y_pred)`
+
+Fairlearn’s `MetricFrame` is pure post-hoc analysis. It never touches the model.
+
+```text
+ ┌──────────────────────────────────────┐
+ │ Vendor Black-Box Model (.pt, API)    │
+ │ ╳ no weights ╳ no training data      │
+ └──────────────────┬───────────────────┘
+                    │ inference only
+                    ▼
+          ┌──────────────────┐
+          │ y_pred (or      │
+          │ y_score)        │
+          └────────┬─────────┘
+                   │
+        ┌──────────┼───────────┐
+        ▼          ▼           ▼
+     y_true   sensitive_feat  metrics
+              (sex, age,      (sens,
+              scanner)        spec, PPV)
+        └──────────┬───────────┘
+                   ▼
+          ┌──────────────────┐
+          │ MetricFrame      │
+          │ disaggregated +  │
+          │ disparity (max-  │
+          │ min, ratio, diff)│
+          └──────────────────┘
+```
+
+So for vendor model auditing you can compute per-subgroup sensitivity, specificity, PPV/NPV, AUROC, calibration; plus disparity metrics like demographic parity difference, equalized odds difference, and equal opportunity difference. All of this requires zero model access.
+
+### What about mitigation?
+
+Here’s where vendor lock-in starts to bite:
+
+```text
+ Need model access?
+ ┌─────────────────┬──────────────────────────┬────┐
+ │ Pre-processing  │ modifies training data    │ ✗  │
+ │ (Reweighing,    │                          │    │
+ │ CorrelationRem) │                          │    │
+ ├─────────────────┼──────────────────────────┼────┤
+ │ In-processing   │ modifies training loss    │ ✗  │
+ │ (Exponentiated  │                          │    │
+ │ Gradient)       │                          │    │
+ ├─────────────────┼──────────────────────────┼────┤
+ │ Post-processing │ adjusts thresholds on     │ ✓  │
+ │ (Threshold      │ scores per subgroup       │    │
+ │ Optimizer)      │                          │    │
+ └─────────────────┴──────────────────────────┴────┘
+```
+
+Critical caveat: `ThresholdOptimizer` needs prediction scores (probabilities), not just hard labels. If the vendor only returns binary abnormal/normal, you’re limited to auditing — you can’t recalibrate per subgroup.
+
+If you do get scores, you can wrap them in a trivial “identity estimator” and let `ThresholdOptimizer` learn group-specific cutoffs that equalize, say, false-positive rates across sexes. This gives you a deployment-time correction layer that sits between the vendor model and clinical use.
+
+### A typical radiology vendor-audit workflow
+
+```text
+ ┌──────────────────────────────────────────────┐
+ │ 1. Curate local eval set                     │
+ │    (n ≥ 100 per subgroup ideal)              │
+ │    + ground truth + sensitive attrs          │
+ ├──────────────────────────────────────────────┤
+ │ 2. Run vendor inference → y_pred, y_score    │
+ ├──────────────────────────────────────────────┤
+ │ 3. MetricFrame audit                         │
+ │    by sex / age / scanner / site             │
+ ├──────────────────────────────────────────────┤
+ │ 4. Report disparities to procurement / IRB   │
+ ├──────────────────────────────────────────────┤
+ │ 5. Optional: ThresholdOptimizer if scores    │
+ │    available and disparity is unacceptable   │
+ └──────────────────────────────────────────────┘
+```
+
+### Practical limitations to watch for
+
+The black-box scenario adds some real constraints. Sample size per subgroup matters more than usual — disparity metrics get noisy fast when a subgroup has fewer than ~50–100 cases with positive ground truth. Score availability is vendor-dependent; many DICOM-integrated products only emit binary flags or categorical findings. Sensitive attribute leakage can be subtle — even if the vendor didn’t see “sex” explicitly, the model may have learned it from the pixels, so audits remain meaningful. And distribution shift from your local population vs. the vendor’s training cohort is a confounder — a disparity you measure could be a generalization failure rather than an intrinsic fairness issue, though arguably both matter clinically.
+
+## 2. AIF360 in the black-box setting
+
+AIF360 also supports the black-box / inference-only case, but the developer experience is clunkier than Fairlearn for this exact use case.
+
+### How AIF360 handles inference-only data
+
+AIF360’s central abstraction is the `BinaryLabelDataset` (or `StandardDataset`). You wrap your DataFrame containing features, ground truth, predictions, and sensitive attributes — no model needed.
+
+```text
+ ┌──────────────────────────────────────────────┐
+ │ Vendor Black-Box Model                       │
+ │ ╳ no weights ╳ no training data              │
+ └──────────────────┬───────────────────────────┘
+                    │ inference only
+                    ▼
+ DataFrame: [X, y_true, y_pred, sex, age]
+                    │
+                    ▼
+        ┌──────────────────────────────┐
+        │ BinaryLabelDataset (truth)   │
+        │ BinaryLabelDataset (pred)    │
+        └──────────────┬───────────────┘
+                       ▼
+        ┌──────────────────────────────┐
+        │ ClassificationMetric         │
+        │ - statistical_parity_diff    │
+        │ - equal_opportunity_diff     │
+        │ - average_odds_diff          │
+        │ - disparate_impact           │
+        │ - theil_index                │
+        │ - generalized_entropy_index  │
+        └──────────────────────────────┘
+```
+
+You essentially create two dataset objects — one holding ground truth, one holding predictions — then pass both to `ClassificationMetric`. It computes the disparity suite without ever asking about the model.
+
+### Audit capability comparison
+
+```text
+ Capability             │ Fairlearn │ AIF360
+ ───────────────────────┼───────────┼─────────
+ Group fairness         │ ✓         │ ✓
+ Individual fairness    │ ✗         │ ✓ (Theil, GEI)
+ Counterfactual         │ ✗         │ ✓ (limited)
+ Intersectional groups  │ ✓         │ ✓ (manual)
+ Sklearn integration    │ ✓         │ ✗
+ API ergonomics         │ clean     │ verbose
+ Custom metrics         │ ✓         │ ✓
+```
+
+AIF360’s edge for vendor auditing: individual fairness metrics like Theil index and generalized entropy index, which Fairlearn lacks. These are useful when you want a single scalar capturing inequality across the entire prediction distribution rather than just pairwise group differences — handy for executive summaries or regulatory reports.
+
+### Mitigation without model access
+
+Same constraint as Fairlearn — you’re restricted to post-processing algorithms:
+
+```text
+ ┌────────────────────────────────────────────────┐
+ │ AIF360 Post-Processing (model-free)            │
+ │                                                │
+ │ • EqOddsPostprocessing                         │
+ │   ↳ randomized label flipping per group        │
+ │   ↳ needs y_true + y_pred only                 │
+ │                                                │
+ │ • CalibratedEqOddsPostprocessing               │
+ │   ↳ adjusts calibrated scores per group        │
+ │   ↳ needs y_score (probabilities)              │
+ │                                                │
+ │ • RejectOptionClassification                   │
+ │   ↳ flips uncertain predictions near           │
+ │     decision boundary toward fairness          │
+ │   ↳ needs y_score                              │
+ └────────────────────────────────────────────────┘
+```
+
+`RejectOptionClassification` is genuinely interesting for radiology — it only modifies predictions where the model is uncertain (scores near 0.5), preserving high-confidence outputs. Conceptually, it is closer to “defer ambiguous cases” workflows that already exist in clinical AI.
+
+### When to actually reach for AIF360 over Fairlearn
+
+```text
+ Scenario                                │ Pick
+ ────────────────────────────────────────┼──────────
+ Quick audit, sklearn workflow           │ Fairlearn
+ Stakeholder dashboard                   │ Fairlearn
+ Need Theil / entropy / individual fair  │ AIF360
+ Need RejectOptionClassification         │ AIF360
+ Regulatory submission, broad metric set │ AIF360
+ Comparing many mitigation algorithms    │ AIF360
+```
+
+## 3. The honest practitioner take
+
+For vendor radiology AI auditing specifically, Fairlearn will get you 80% of the way with 20% of the boilerplate. Reach for AIF360 when:
+
+1. You need a metric Fairlearn doesn’t have (individual fairness, entropy-based).
+2. You want `RejectOptionClassification` as a post-hoc safety layer.
+3. You’re producing a formal audit report and want the broader metric coverage to demonstrate thoroughness.
+
+A common pattern for AiSmartOps: use Fairlearn for routine monitoring and dashboards, keep AIF360 in the toolbox for one-off deep audits or when reviewers/regulators ask for metrics Fairlearn doesn’t expose. Combined with the broader monitoring pattern in the [AI Fairness Suite chapter](fairness_suite_aif360_fairlearn.qmd), this gives you a practical path for black-box vendor models: audit first, post-process only when scores are available and the governance case is strong.

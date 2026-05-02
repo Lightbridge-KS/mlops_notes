@@ -55,6 +55,8 @@ book:
           href: "contents/eval/frozen_encoder_hidden_activations.qmd"
         - text: "AI Fairness Suite — AIF360 + Fairlearn"
           href: "contents/eval/fairness_suite_aif360_fairlearn.qmd"
+        - text: "Fairness Auditing for Vendor-Locked Black-Box Models"
+          href: "contents/eval/black_box_vendor_fairness_audit.qmd"
     - part: Landscape & Protocols
       chapters: 
         - text: "OSS Landscape for AI Orchestraction"
