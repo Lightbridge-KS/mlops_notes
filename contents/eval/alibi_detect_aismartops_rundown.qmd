@@ -1,0 +1,256 @@
+---
+title: "Alibi Detect — A Rundown for AiSmartOps"
+---
+
+## 1. What it is, in one paragraph
+
+Alibi Detect is a Python library from Seldon focused on three things: drift detection, outlier detection, and adversarial-input detection. It is the most algorithmically sophisticated of the open-source drift libraries — it ships kernel-based (MMD, LSDD), classifier-based, and context-aware drift detectors that work natively on images, text, time series, and tabular data, with both TensorFlow and PyTorch backends. Latest release is 0.13.0 (Dec 2025). Where [Evidently](evidently_aismartops_rundown.qmd) is broad-but-tabular, Alibi Detect is narrow-but-image-capable — and that is exactly the gap radiology AI needs filled.
+
+## 2. The license situation — read this before anything else
+
+This is the headline caveat the [OSS landscape chapter](../deep-research/OSS_Landscape_BuildingBlock_DeepResearch.qmd) flagged, and it’s been confirmed:
+
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│ Pre-22 Jan 2024: Apache 2.0 (versions ≤ 0.11.5)                   │
+│ Post-22 Jan 2024: BSL 1.1 (versions ≥ 0.12.0, including 0.13)     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+BSL 1.1 means production use requires a commercial license from Seldon, with one carve-out that matters to you: the Additional Use Grant explicitly permits non-profit educational institutions to use it for production — provided you do not commercialize the platform or “incorporate the Licensed Work into any models, products or services sold, licensed, marketed, or offered for sale to third-parties.” After 4 years, each released version reverts to Apache 2.0 (the “Change License” / “Change Date” mechanism).
+
+For your AiSmartOps project, this creates a concrete legal fork:
+
+```text
+ Ramathibodi-internal use only        Plan to license/sell to other
+ (hospital deployment within          hospitals or external parties
+ Mahidol University)                  (the OBJ-3 sandbox ecosystem)
+ │                                    │
+ ▼                                    ▼
+ Likely allowed under                 Likely BREAKS the Additional
+ BSL Additional Use Grant.            Use Grant. Either pay Seldon,
+ Still: have university               stay on the last Apache 2.0
+ legal counsel sign off.              version (0.11.5), or migrate
+                                      to a clean alternative.
+```
+
+Practical recommendations: (a) pin to the last Apache 2.0 version (0.11.5, Jan 2024) for the platform’s redistributable core — it’s stable and contains all the algorithms you actually need; (b) use newer BSL versions only for internal Ramathibodi research code; (c) get a written legal opinion from Mahidol legal before relying on the Additional Use Grant in any deployment that touches the Medical AI Consortium (since consortium members are third parties).
+
+## 3. The three detector families
+
+This is the mental model. Same library, three problem types:
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐     │
+│ │ DRIFT            │ │ OUTLIER          │ │ ADVERSARIAL      │     │
+│ │ DETECTION        │ │ DETECTION        │ │ DETECTION        │     │
+│ │                  │ │                  │ │                  │     │
+│ │ "Has the input   │ │ "Is THIS image   │ │ "Has someone     │     │
+│ │ distribution     │ │ from a           │ │ crafted this     │     │
+│ │ shifted from     │ │ different        │ │ input to fool    │     │
+│ │ the reference    │ │ distribution     │ │ the model?"      │     │
+│ │ at population    │ │ at the single    │ │                  │     │
+│ │ level?"          │ │ sample level?"   │ │                  │     │
+│ │                  │ │                  │ │                  │     │
+│ │ Population       │ │ Per-sample       │ │ Per-sample       │     │
+│ │ level            │ │ level            │ │ level            │     │
+│ └──────────────────┘ └──────────────────┘ └──────────────────┘     │
+│                                                                     │
+│ Use for PMS          Use as runtime       Use as runtime            │
+│ monitoring           input gate           input gate                │
+│ dashboard alerts     (reject OOD)         (reject attack)           │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+This three-way split is operationally distinct from Evidently’s metric/test/dashboard split. Evidently’s dimension is how you deploy (one-shot vs. CI vs. continuous). Alibi Detect’s dimension is what kind of question you’re asking. They are complementary, not redundant.
+
+## 4. The detector catalog
+
+```text
+DRIFT (the headline strength)
+─────────────────────────────────────────────────────────────────
+ Statistical (univariate, per-feature):
+ • KSDrift             Kolmogorov-Smirnov
+ • ChiSquareDrift      categorical
+ • CVMDrift            Cramér-von Mises
+ • FETDrift            Fisher exact (binary)
+
+ Multivariate / kernel (the IMAGE workhorses):
+ • MMDDrift            Maximum Mean Discrepancy
+ • LSDDDrift           Least-Squares Density Difference
+ • LearnedKernelDrift  Trainable deep kernel — best for images
+
+ Classifier-based:
+ • ClassifierDrift     Trains a domain classifier; high AUC ⇒ drift
+ • SpotTheDiffDrift    Interpretable variant: tells you *which*
+                       features moved
+
+ Specialized:
+ • ContextMMDDrift     Conditional drift given covariates (e.g.,
+                       drift in CT *holding* age & scanner fixed)
+ • ChunkKSDrift        Streaming
+ • MMDDriftOnline,
+   LSDDDriftOnline     Sequential / online detectors with
+                       controlled false-alarm rates
+
+OUTLIER
+─────────────────────────────────────────────────────────────────
+ • OutlierVAE          Variational autoencoder reconstruction
+ • OutlierAEGMM        Autoencoder + GMM
+ • Mahalanobis         Classic
+ • IForest, LOF        Tabular
+ • LLR                 Likelihood-ratio for images
+ • PixelCNN-based      Generative-model OOD
+
+ADVERSARIAL
+─────────────────────────────────────────────────────────────────
+ • AdversarialAE       Autoencoder-based detector
+ • ModelDistillation   Distillation residual flags evasion
+```
+
+## 5. The killer feature for radiology — `preprocess_drift`
+
+This is the single most important architectural pattern Alibi Detect gives you, and it’s why it earns a place in the stack despite the license headache. You don’t run drift on raw 512×512×16 pixel arrays — that would be statistically meaningless. Instead, you run drift on the hidden activations of a frozen encoder:
+
+```text
+ Raw DICOM pixels      Frozen encoder        Drift detector
+ ───────────────────   ─────────────────     ─────────────────
+ ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+ │              │      │ ResNet-50    │      │              │
+ │ CT slice     │ ───► │ pretrained   │ ───► │ MMDDrift     │
+ │ 512×512×1    │      │ on ImageNet  │      │ on features  │
+ │              │      │ or RadImageNet│     │              │
+ └──────────────┘      │ (or DINOv2,  │      │ p < 0.05     │
+                       │ MedSAM enc.) │      │ ⇒ drift!     │
+                       └──────────────┘      └──────────────┘
+                           FROZEN
+                         (no training)
+```
+
+In Alibi Detect this is one line:
+
+```python
+from alibi_detect.cd import MMDDrift
+from alibi_detect.cd.pytorch import HiddenOutput, preprocess_drift
+from functools import partial
+
+# Frozen pretrained encoder — RadImageNet, DINOv2, or your own.
+encoder = HiddenOutput(model=resnet50_radimagenet, layer=-2)
+preprocess_fn = partial(preprocess_drift, model=encoder, batch_size=32)
+
+cd = MMDDrift(
+    x_ref=ref_images,  # baseline cohort
+    backend="pytorch",
+    p_val=0.05,
+    preprocess_fn=preprocess_fn,
+)
+
+result = cd.predict(x=this_weeks_images)
+# result['data']['is_drift'] → 0 or 1
+# result['data']['p_val'] → significance
+# result['data']['distance'] → MMD value
+```
+
+This is the radiology drift contract Evidently cannot give you. It works because pretrained image encoders compress imaging variability (scanner, protocol, dose) into a low-dimensional manifold where MMD is statistically powerful and computationally tractable.
+
+## 6. How Alibi Detect slots into the AiSmartOps stack
+
+Alibi Detect is not a backbone — it’s a targeted complement to Evidently. Two specific placements:
+
+```text
+ AI SMART ORCHESTRATION PLATFORM
+ ─────────────────────────────────────────────────────────────────────
+
+ ┌─────────────┐ ┌──────────────┐ ┌─────────────────────┐
+ │ DICOM in    │►│ Orchestrator │►│ Inference (Triton)  │
+ │ (PACS)      │ │ (MONAI / MIG)│ │                     │
+ └──────┬──────┘ └───────┬──────┘ └──────────┬──────────┘
+        │                │                   │
+        │ ① runtime gate │                   │ ② PMS sidecar
+        ▼                │                   ▼
+ ┌──────────────────┐    │          ┌──────────────────┐
+ │ Alibi Detect     │    │          │ Alibi Detect     │
+ │ ─ OutlierVAE     │    │          │ ─ MMDDrift on    │
+ │   (reject hand   │    │          │   encoder feats  │
+ │   X-rays sent to │    │          │ ─ ContextMMD     │
+ │   chest model)   │    │          │   (drift after   │
+ │ ─ Adversarial    │    │          │   adjusting for  │
+ │   AE detector    │    │          │   age/scanner)   │
+ └──────────────────┘    │          └──────────┬───────┘
+        │                │                     │
+        ▼                │                     ▼
+ block / route           │          ┌──────────────────┐
+ to fallback             │          │ Evidently        │
+        │                │          │ Monitoring UI    │
+        ▼                │          │ (consume drift   │
+ ┌─────────────────┐     │          │ scores as just   │
+ │ MLflow registry │     │          │ another metric)  │
+ │ + audit log     │     │          └──────────────────┘
+ └─────────────────┘
+```
+
+Placement ① — Runtime input gate (Outlier + Adversarial): a sample-level filter that runs before inference. If a hand X-ray gets routed to the chest-X-ray model, OutlierVAE rejects it. If an input has been adversarially perturbed (rare clinically, but a regulatory requirement under FUTURE-AI’s Robustness principle), AdversarialAE flags it. Latency budget: tens of milliseconds.
+
+Placement ② — PMS drift sidecar (Drift detection): runs on batched accumulated inputs (daily/weekly), computes MMD or LearnedKernel drift against the validated reference cohort, and publishes the resulting drift score as a metric to your Evidently dashboard. This way the radiologist sees one unified surveillance UI; Alibi Detect is the engine, Evidently is the cockpit.
+
+## 7. Where Alibi Detect specifically fits the FUTURE-AI principles
+
+```text
+FUTURE-AI principle       Alibi Detect contribution
+──────────────────────────────────────────────────────────────────────
+Robustness                → AdversarialAE; OutlierVAE for OOD; MMDDrift for
+                            covariate shift detection. ★ Primary fit ★
+Universality              → ContextMMDDrift to test "does this model perform
+                            equivalently across hospital sites/scanners after
+                            conditioning on demographics?"
+Traceability              → Drift detector state can be saved/loaded with full
+                            provenance — the same reference distribution your
+                            PIE used is the one PMS alerts on.
+Fairness                  → Subgroup drift (run MMDDrift per demographic slice).
+                            But for fairness *metrics* per se, AIF360/Fairlearn
+                            are the proper tools.
+```
+
+## 8. What it does not solve (the gaps)
+
+```text
+NOT in Alibi Detect                  → Pair with
+─────────────────────────────────────────────────────────────────────
+Performance metrics, ROC, F1          Evidently / scikit-learn
+Performance estimation w/o GT         NannyML
+Tabular EDA / data quality            Evidently / Great Expectations
+Bias / fairness metrics               AIF360, Fairlearn
+Explainability (SHAP, Grad-CAM)       SHAP, Captum, MONAI
+Pretty production dashboards          Evidently UI, Grafana
+Hospital-grade audit logging          MLflow, your platform itself
+```
+
+It’s a single-purpose specialist — drift, outlier, adversarial. Treat it that way.
+
+## 9. Bottom line for AiSmartOps
+
+```text
+ ┌────────────────────────────────────────┐
+ │ Use Alibi Detect for the ONE thing it  │
+ │ uniquely does well: image-aware drift  │
+ │ + outlier + adversarial detection on   │
+ │ raw radiology inputs (via frozen-      │
+ │ encoder feature embeddings).           │
+ │                                        │
+ │ Pin to v0.11.5 (Apache 2.0) for the    │
+ │ redistributable platform core.         │
+ │                                        │
+ │ Publish its outputs as metrics into    │
+ │ Evidently — don't expose its UI.       │
+ │                                        │
+ │ Get Mahidol legal sign-off before      │
+ │ relying on the BSL non-profit          │
+ │ educational Use Grant for any version  │
+ │ post-0.12.                             │
+ └────────────────────────────────────────┘
+```
+
+The mental shorthand: Evidently is your tabular monitoring backbone; [NannyML](../deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd) is your no-ground-truth performance estimator; Alibi Detect is your image-pixel drift detective. Three tools, three jobs, with Evidently as the integration surface that ties them together.
