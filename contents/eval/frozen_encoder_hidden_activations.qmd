@@ -1,0 +1,151 @@
+---
+title: "Frozen Encoder + Hidden Activations — Plain Explanation"
+---
+
+This chapter unpacks two terms that appear in the [Alibi Detect AiSmartOps rundown](alibi_detect_aismartops_rundown.qmd), because they are really one combined idea: “use someone else’s already-trained vision system as a fixed feature extractor.”
+
+## 1. What an “encoder” is
+
+A neural network for image classification has two conceptual halves:
+
+```text
+ ┌──────────────────────────────────────────────────────────────┐
+ │                                                              │
+ │ Input image                 ENCODER                HEAD      │
+ │ (high-dim)                  (compresses)           (decides) │
+ │                                                              │
+ │ ┌──────────┐        ┌─────────────────┐      ┌──────────────┐│
+ │ │          │        │ conv → conv →   │      │ Dense layer  ││
+ │ │ 224x224  │───────►│ pool → conv →   │─────►│ → softmax    ││
+ │ │ x3 RGB   │        │ ... → flatten   │      │ → probs      ││
+ │ │ ~150K    │        │                 │      └──────────────┘│
+ │ │ numbers  │        │ outputs:        │              │       │
+ │ └──────────┘        │ 2048-dim vector │              ▼       │
+ │                     └─────────────────┘            "cat"     │
+ │                              ▲                               │
+ │                              │                               │
+ │                     This vector is the                       │
+ │                     "feature embedding"                      │
+ │                     or "hidden activation"                   │
+ │                                                              │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+The encoder is the front part — many convolutional/transformer layers that progressively turn ~150,000 raw pixel numbers into a compact ~2,000-number vector. That vector is a summary of the image: “high contrast edges here, lung-like texture there, rounded opacity in upper-right region…” — except it’s the network’s own learned numeric language, not human words.
+
+The head is the back part — usually a small dense layer that maps the summary vector to class probabilities.
+
+## 2. What “hidden activation” means
+
+In a neural network, every layer produces a tensor of numbers when you push an input through. Those numbers are called activations because they represent how strongly each neuron “fires” for that input.
+
+```text
+ Input ──► Layer 1 ──► Layer 2 ──► Layer 3 ──► ... ──► Output
+              │           │           │
+              ▼           ▼           ▼
+           activ_1     activ_2     activ_3
+          (visible)   ("hidden")  ("hidden")
+```
+
+The output layer’s activation is the visible prediction (e.g., class probabilities). All the intermediate layers’ activations are called hidden — not because they’re secret, just because they’re internal to the network and not normally exposed.
+
+When we say “hidden activation of layer −2” (the second-to-last layer, just before the classification head), we mean the rich feature vector that contains everything the network has learned about the image, before it gets squashed down to a class label.
+
+This is the part we want for drift detection — it’s the network’s “understanding” of the image.
+
+## 3. What “frozen” means
+
+A neural network has two states it can be in:
+
+```text
+ ┌─────────────────────────────────────────────────────────────────┐
+ │                                                                 │
+ │ TRAINABLE (default)                  FROZEN (locked)            │
+ │ ─────────────────                    ──────────────             │
+ │                                                                 │
+ │ Weights update with                  Weights NEVER change.      │
+ │ every training step.                 Same input → same output,  │
+ │ Same input today vs.                 forever.                   │
+ │ next week → different                Pure deterministic         │
+ │ output.                              function.                  │
+ │                                                                 │
+ │ for param in model.parameters():                                │
+ │     param.requires_grad = True    ◄── default                   │
+ │                                                                 │
+ │ for param in model.parameters():                                │
+ │     param.requires_grad = False   ◄── frozen                    │
+ │                                                                 │
+ │ model.eval()  ← also disables dropout, batch-norm updates       │
+ │                                                                 │
+ └─────────────────────────────────────────────────────────────────┘
+```
+
+In PyTorch, freezing is literally setting `requires_grad = False` on every weight. The model still runs forward (inference still works), but no gradient is computed and no weight updates happen. The network becomes a fixed mathematical function — image in, vector out, identical every time.
+
+## 4. Why both pieces matter together for drift detection
+
+Here’s the radiology-flavored reasoning:
+
+```text
+ Why "encoder"?      → We need to compare images, but raw pixels are
+                       too high-dimensional and too noisy. The encoder
+                       compresses each image into a meaningful 2048-dim
+                       summary where statistical comparison is feasible.
+
+ Why "pretrained"?   → Training a new encoder from scratch on Ramathibodi
+                       data would itself be a model, with its own drift,
+                       its own bias, its own validation burden. We want
+                       to BORROW someone else's already-trained vision
+                       system — RadImageNet, DINOv2, MedSAM's encoder —
+                       and use it as a reference measuring stick.
+
+ Why "frozen"?       → If the encoder's weights changed, the same chest
+                       X-ray would map to different points in feature
+                       space at different times. Drift detection would
+                       become meaningless — we couldn't tell if drift
+                       comes from the data or from the measuring stick.
+                       Freezing guarantees the measuring stick is
+                       constant.
+```
+
+A radiology analogy: imagine you want to track whether the patients arriving at your hospital this month “look different” from last year’s cohort. You hire a senior radiologist who has trained for 30 years on diverse imaging from many institutions, and you ask them to summarize each new study with a fixed checklist of 2,048 visual descriptors — same checklist every time, for every patient, forever. They are frozen (no new learning) and they are an encoder (they compress a complex image into a fixed-length summary). Over time, you compare summary distributions. That is what `preprocess_drift(model=HiddenOutput(model, layer=-2))` does in code.
+
+## 5. The full picture in one diagram
+
+```text
+ Reference cohort                         Today's cohort
+ (validation set,                         (last 7 days of
+ what was "normal" at PIE)                production studies)
+
+ ┌───────────────┐                        ┌───────────────┐
+ │ 1000 chest    │                        │ 200 chest     │
+ │ X-rays        │                        │ X-rays        │
+ └───────┬───────┘                        └───────┬───────┘
+         │                                        │
+         │          Frozen encoder                │
+         │          (RadImageNet ResNet-50,        │
+         │          requires_grad = False,         │
+         │          .eval() mode)                  │
+         ▼                                        ▼
+ ┌───────────────┐                        ┌───────────────┐
+ │ 1000 vectors  │                        │ 200 vectors   │
+ │ × 2048 dim    │                        │ × 2048 dim    │
+ │ "ref features"│                        │ "cur features"│
+ └───────┬───────┘                        └───────┬───────┘
+         │                                        │
+         └──────────────┬─────────────────────────┘
+                        │
+                        ▼
+              ┌────────────────────┐
+              │ MMD test:          │
+              │ are these two      │
+              │ point clouds       │
+              │ from the same      │
+              │ distribution?      │
+              │                    │
+              │ p < 0.05 ⇒         │
+              │ DRIFT DETECTED     │
+              └────────────────────┘
+```
+
+So when the [Alibi Detect chapter](alibi_detect_aismartops_rundown.qmd) says “hidden activations of a frozen encoder,” it means: take a pretrained vision network, lock its weights so it never changes, push your medical images through it, and grab the internal feature vector from a layer just before its classification head. Those vectors become your numeric stand-in for the images, and that is what drift detection actually compares.
