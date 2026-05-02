@@ -35,10 +35,14 @@ book:
       chapters: 
         - text: "IOMapping in MonaiBundleInferenceOperator"
           href: "contents/monai/monai_IOMapping.qmd"
-    - part: Orchestrator
+    - part: DICOM Orchestrator
       chapters: 
         - text: "Mercure DICOM Orchestrator"
           href: "contents/orchestrator/mercure_dcm_orchestrator.qmd"
+    - part: MLFlow
+      chapters: 
+        - text: "MLFlow"
+          href: "contents/lifecycle/mlflow-rundown.qmd"
     - part: Monitoring & Evaluation Overview
       chapters: 
         - text: "Monitoring Stack Explanation"

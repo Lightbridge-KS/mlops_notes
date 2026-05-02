@@ -1,0 +1,197 @@
+---
+title: "MLflow: A Rundown"
+---
+
+MLflow is an **open-source platform for managing the end-to-end machine learning lifecycle**, originally built by Databricks (released in 2018). It's now one of the most widely adopted MLOps tools and is part of the Linux Foundation.
+
+## The Problem It Solves
+
+ML projects are notoriously messy. You typically run dozens to hundreds of experiments with different hyperparameters, datasets, model architectures, and code versions. Without discipline, you end up asking questions like *"Which run produced that 0.92 AUC again?"* or *"Why can't I reproduce last month's results?"* MLflow gives you a structured way to track, package, version, and deploy ML models.
+
+## The Four Core Components
+
+MLflow is organized as four loosely-coupled components — you can use any one without the others.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         MLflow                              │
+├──────────────┬──────────────┬──────────────┬────────────────┤
+│   Tracking   │   Projects   │    Models    │    Registry    │
+│              │              │              │                │
+│  Log params, │  Reproducible│  Standardized│  Central model │
+│  metrics,    │  packaging   │  model       │  store with    │
+│  artifacts   │  of ML code  │  format      │  versioning    │
+│              │              │              │  & stages      │
+└──────────────┴──────────────┴──────────────┴────────────────┘
+```
+
+### 1. MLflow Tracking — *the experiment journal*
+
+This is the component most people start with. It's an API + UI for logging:
+
+- **Parameters** — hyperparameters, config (e.g., learning rate, batch size)
+- **Metrics** — accuracy, loss, AUC, sensitivity, specificity
+- **Artifacts** — model files, plots, confusion matrices, ROC curves
+- **Source code version** — Git commit hash
+- **Tags** — free-form metadata
+
+A minimal example in Python:
+
+```python
+import mlflow
+
+mlflow.set_experiment("chest-xray-pneumonia")
+
+with mlflow.start_run():
+    mlflow.log_param("learning_rate", 1e-4)
+    mlflow.log_param("backbone", "resnet50")
+    mlflow.log_metric("val_auc", 0.91)
+    mlflow.log_artifact("roc_curve.png")
+    mlflow.pytorch.log_model(model, "model")
+```
+
+Then `mlflow ui` launches a local web dashboard to compare runs side-by-side.
+
+### 2. MLflow Projects — *reproducible code packaging*
+
+A "project" is just a directory with an `MLproject` YAML file that declares the entry points, parameters, and environment (conda, virtualenv, or Docker). Anyone can then run it with one command:
+
+```bash
+mlflow run https://github.com/your-org/pneumonia-classifier -P lr=1e-4
+```
+
+In practice, many teams skip Projects in favor of their own orchestration (Airflow, Prefect, or just CI). Tracking and Models are used much more widely.
+
+### 3. MLflow Models — *a standard format for ML models*
+
+This is conceptually the cleanest part of MLflow. A model is saved as a directory containing:
+
+```
+model/
+├── MLmodel              ← metadata file (which "flavors" are supported)
+├── conda.yaml           ← environment spec
+├── requirements.txt
+└── model.pkl            ← actual serialized model
+```
+
+The key idea is **flavors**. The same model can be saved with multiple flavors — e.g., a PyTorch model can have a `pytorch` flavor *and* a generic `python_function` flavor. This means downstream tools don't need to know whether your model is sklearn, PyTorch, TensorFlow, XGBoost, etc. They just call the standard interface:
+
+```
+┌──────────────────┐     ┌──────────────────────────┐
+│  Your training   │     │  MLflow Model            │
+│  code (any FW)   │ ──▶ │                          │
+│                  │     │  ├── pytorch flavor      │
+│  PyTorch /       │     │  ├── python_function     │
+│  sklearn /       │     │  │   flavor (universal)  │
+│  XGBoost / ...   │     │  └── metadata            │
+└──────────────────┘     └────────────┬─────────────┘
+                                      │
+                ┌─────────────────────┼─────────────────────┐
+                ▼                     ▼                     ▼
+        ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+        │ REST API     │     │ Batch infer  │     │ Docker image │
+        │ (mlflow      │     │ (Spark UDF)  │     │ build        │
+        │  serve)      │     │              │     │              │
+        └──────────────┘     └──────────────┘     └──────────────┘
+```
+
+This "build once, deploy many ways" property is what makes MLflow attractive for production.
+
+### 4. MLflow Model Registry — *the model warehouse*
+
+Tracking gives you *runs*. Registry gives you *named, versioned models* with a lifecycle. You register a model and it gets versions (v1, v2, v3, …), each of which can be tagged with a stage:
+
+```
+        Registered Model: "pneumonia-classifier"
+        ┌─────────────────────────────────────────┐
+        │                                         │
+        │   v1  ─────▶  [Archived]                │
+        │                                         │
+        │   v2  ─────▶  [Production]  ← serving   │
+        │                                         │
+        │   v3  ─────▶  [Staging]     ← testing   │
+        │                                         │
+        │   v4  ─────▶  [None]        ← just      │
+        │                               registered│
+        └─────────────────────────────────────────┘
+```
+
+Newer MLflow versions replace the fixed stages (Staging/Production/Archived) with **aliases** and **tags**, which are more flexible. The Registry is where governance lives — approvals, audit trails, who promoted what.
+
+## How It Fits Together — A Typical Workflow
+
+```
+   ┌───────────────┐
+   │  Data + Code  │
+   └───────┬───────┘
+           │
+           ▼
+   ┌───────────────┐    log_param, log_metric,
+   │   Training    │───▶ log_artifact, log_model
+   │   Script      │
+   └───────┬───────┘             │
+           │                     ▼
+           │            ┌──────────────────┐
+           │            │ MLflow Tracking  │
+           │            │   Server         │  ◀── compare runs in UI
+           │            └────────┬─────────┘
+           │                     │
+           │            register_model()
+           │                     │
+           │                     ▼
+           │            ┌──────────────────┐
+           │            │  Model Registry  │
+           │            │  v1, v2, v3...   │  ◀── promote to "Production"
+           │            └────────┬─────────┘
+           │                     │
+           │                     ▼
+           │            ┌──────────────────┐
+           └──────────▶ │  Deployment      │
+                        │  (REST / batch)  │
+                        └──────────────────┘
+```
+
+## Architecture: What Actually Runs
+
+When you self-host MLflow, three pieces are involved:
+
+```
+   ┌────────────┐     HTTP      ┌────────────────┐
+   │  Client    │ ───────────▶  │  Tracking      │
+   │  (your     │               │  Server        │
+   │  Python    │               │  (mlflow       │
+   │  code)     │               │   server)      │
+   └────────────┘               └───┬────────┬───┘
+                                    │        │
+                          metadata  │        │  artifacts
+                                    ▼        ▼
+                          ┌─────────────┐  ┌─────────────┐
+                          │  Backend    │  │  Artifact   │
+                          │  Store      │  │  Store      │
+                          │             │  │             │
+                          │  PostgreSQL │  │  S3 / GCS / │
+                          │  /MySQL/    │  │  Azure Blob │
+                          │  SQLite     │  │  /local FS  │
+                          └─────────────┘  └─────────────┘
+```
+
+The split between **backend store** (small structured metadata) and **artifact store** (large blobs like model weights and images) is intentional — it lets you scale storage independently.
+
+## Where MLflow Sits in the MLOps Landscape
+
+MLflow is **strongest** at experiment tracking, model packaging, and the registry. It's **weaker** (or simply doesn't try) at:
+
+- Data versioning → use **DVC** or **LakeFS**
+- Pipeline orchestration → use **Airflow**, **Prefect**, **Kubeflow Pipelines**
+- Feature stores → use **Feast**, **Tecton**
+- Model monitoring in production → use **Evidently**, **Arize**, or roll your own
+
+A common modern stack: **DVC** (data) + **MLflow** (experiments + models) + **Airflow/Prefect** (orchestration) + **Evidently** (monitoring).
+
+## Why It's Particularly Useful for Radiology AI Work
+
+For your Radiology AI Unit context, three things stand out:
+
+1. **Reproducibility for regulatory/audit purposes** — every model that goes near patients should have a traceable lineage from data to weights. The Registry + Tracking combination gives you that out of the box.
+2. **Comparing many experiments** — medical imaging models involve a lot of hyperparameter and architecture sweeps. The MLflow UI is genuinely good at this.
+3. **Framework-agnostic packaging** — radiology AI work often mixes PyTorch (for deep learning), sklearn (for radiomics), and sometimes ONNX (for deployment). MLflow Models handles all of these uniformly.
