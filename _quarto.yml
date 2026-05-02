@@ -39,20 +39,26 @@ book:
       chapters: 
         - text: "Mercure DICOM Orchestrator"
           href: "contents/orchestrator/mercure_dcm_orchestrator.qmd"
-    - part: Monitoring Tools
+    - part: Monitoring & Evaluation Overview
       chapters: 
-        - text: "Monitoring Stack Explaination"
+        - text: "Monitoring Stack Explanation"
           href: "contents/eval/monitoring-stack-explainatino.qmd"
-        - text: "NannyML, Post-Deployment ML Monitoring Without Ground Truth"
-          href: "contents/deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd"
+    - part: Evaluation & Monitoring Backbones
+      chapters:
         - text: "Evidently AI"
           href: "contents/eval/evidently.qmd"
         - text: "Evidently — A Rundown for AiSmartOps"
           href: "contents/eval/evidently_aismartops_rundown.qmd"
+        - text: "NannyML, Post-Deployment ML Monitoring Without Ground Truth"
+          href: "contents/deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd"
+    - part: Image Drift & OOD Detection
+      chapters:
         - text: "Alibi Detect — A Rundown for AiSmartOps"
           href: "contents/eval/alibi_detect_aismartops_rundown.qmd"
         - text: "Frozen Encoder + Hidden Activations"
           href: "contents/eval/frozen_encoder_hidden_activations.qmd"
+    - part: Fairness & Bias Auditing
+      chapters:
         - text: "AI Fairness Suite — AIF360 + Fairlearn"
           href: "contents/eval/fairness_suite_aif360_fairlearn.qmd"
         - text: "Fairness Auditing for Vendor-Locked Black-Box Models"
