@@ -41,7 +41,7 @@ book:
           href: "contents/orchestrator/mercure_dcm_orchestrator.qmd"
     - part: MLFlow
       chapters: 
-        - text: "MLFlow"
+        - text: "MLFlow Rundown"
           href: "contents/lifecycle/mlflow-rundown.qmd"
     - part: Monitoring & Evaluation Overview
       chapters: 
