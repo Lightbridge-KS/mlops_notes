@@ -66,7 +66,7 @@ A Report is a snapshot (“here are 30 metrics”). Add pass/fail thresholds and
 
 ## 4. Why the OSS report calls it your “monitoring backbone”
 
-Looking at your `OSS_Landscape_BuildingBlock_DeepResearch.md`, Evidently is the only single tool that scores well on all four of these criteria simultaneously: (a) Apache 2.0 (no AGPL/BSL/SSPL footguns), (b) covers both PIE and PMS, (c) self-hostable on hospital infrastructure, and (d) modular enough that you adopt incrementally. Deepchecks is AGPL, Alibi Detect went BSL, NannyML covers a narrower slice, whylogs is profiling-only. Evidently sits at the intersection.
+Looking at the [OSS landscape chapter](../deep-research/OSS_Landscape_BuildingBlock_DeepResearch.qmd), Evidently is the only single tool that scores well on all four of these criteria simultaneously: (a) Apache 2.0 (no AGPL/BSL/SSPL footguns), (b) covers both PIE and PMS, (c) self-hostable on hospital infrastructure, and (d) modular enough that you adopt incrementally. Deepchecks is AGPL, Alibi Detect went BSL, NannyML covers a narrower slice, whylogs is profiling-only. Evidently sits at the intersection.
 
 ## 5. How Evidently maps to your PIE → PMS lifecycle
 
@@ -169,7 +169,7 @@ Per-inference row (one row per study):
 
 Evidently then monitors drift on this derived schema, which is exactly what FDA-style PMS asks for: “is the input distribution the model is seeing today the same as the distribution it was validated on?” You watch scanner-model drift, intensity-stat drift, prediction-confidence drift, latency drift — all at the orchestrator level, model-agnostic.
 
-This dovetails directly with your `RadAI_Published_Languages_Report.md` insight: because there is no Published Language for radiology AI inference outputs, your platform must define one locally. The Evidently-row schema above effectively becomes that internal published language — a stable tabular contract that every radiology model adapter must produce, regardless of whether the upstream model is a YOLO box-tensor, a SAM mask, or a SR-style classifier. This is a meaningful architectural win, not just plumbing.
+This dovetails directly with the [Published Languages chapter](../deep-research/RadAI_Published_Languages_Report.qmd) insight: because there is no Published Language for radiology AI inference outputs, your platform must define one locally. The Evidently-row schema above effectively becomes that internal published language — a stable tabular contract that every radiology model adapter must produce, regardless of whether the upstream model is a YOLO box-tensor, a SAM mask, or a SR-style classifier. This is a meaningful architectural win, not just plumbing.
 
 ## 8. What Evidently does not solve (so you know the gaps)
 
