@@ -53,6 +53,8 @@ book:
           href: "contents/eval/alibi_detect_aismartops_rundown.qmd"
         - text: "Frozen Encoder + Hidden Activations"
           href: "contents/eval/frozen_encoder_hidden_activations.qmd"
+        - text: "AI Fairness Suite — AIF360 + Fairlearn"
+          href: "contents/eval/fairness_suite_aif360_fairlearn.qmd"
     - part: Landscape & Protocols
       chapters: 
         - text: "OSS Landscape for AI Orchestraction"

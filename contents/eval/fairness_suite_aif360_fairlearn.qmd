@@ -1,0 +1,93 @@
+---
+title: "AI Fairness Suite — AIF360 + Fairlearn"
+---
+
+The phrase “AI Fairness Suite” is informal — these are two distinct, complementary open-source toolkits that practitioners commonly pair as a fairness suite in MLOps pipelines. This chapter unpacks each toolkit, and then how they fit together with monitoring tools such as [Evidently](evidently_aismartops_rundown.qmd) and [Alibi Detect](alibi_detect_aismartops_rundown.qmd).
+
+## The problem they solve
+
+ML models often perform unevenly across demographic subgroups (sex, age, ethnicity, scanner site). In radiology this is well-documented — chest X-ray classifiers underperforming on women, dermatology models trained mostly on light skin, etc. These toolkits help you (1) measure unfairness with quantitative metrics and (2) mitigate it with algorithmic interventions.
+
+```text
+ ┌─────────────────────────┐
+ │ Trained ML Model        │
+ └───────────┬─────────────┘
+             │
+ ┌───────────┴─────────────┐
+ ▼                         ▼
+ ┌────────────────┐        ┌────────────────┐
+ │ Group A        │        │ Group B        │
+ │ (e.g. female)  │        │ (e.g. male)    │
+ │ Sensitivity 85%│        │ Sensitivity 92%│
+ │ FPR 12%        │        │ FPR 5%         │
+ └────────┬───────┘        └────────┬───────┘
+          └─────────────┬───────────┘
+                        ▼
+              ┌───────────────────┐
+              │ Fairness Metric   │
+              │ Δ disparity > ε   │
+              │ → mitigate        │
+              └───────────────────┘
+```
+
+## AIF360 (AI Fairness 360)
+
+- **Origin:** IBM Research, open-sourced 2018
+- **Languages:** Python (primary), R port available
+- **Scope:** ~70 fairness metrics, ~10 mitigation algorithms
+- **Strengths:** Comprehensive, academic-grade. Covers group fairness, individual fairness, and counterfactual notions.
+- **Weaknesses:** Heavier API, doesn’t blend cleanly with sklearn pipelines, steeper curve.
+
+## Fairlearn
+
+- **Origin:** Microsoft Research, now community-maintained
+- **Languages:** Python only
+- **Scope:** Smaller, curated set of metrics + algorithms
+- **Strengths:** Tight scikit-learn integration, excellent `MetricFrame` for disaggregated evaluation, interactive dashboard, clean API.
+- **Weaknesses:** Fewer metrics; mainly group fairness.
+
+## Where they intervene in the pipeline
+
+Both libraries offer three mitigation strategies that target different stages:
+
+```text
+ Raw Data                 Training                Predictions
+    │                        │                        │
+    ▼                        ▼                        ▼
+ ┌──────────┐             ┌──────────┐             ┌──────────┐
+ │ Pre-     │             │ In-      │             │ Post-    │
+ │ process  │────────────►│ process  │────────────►│ process  │
+ │ reweigh, │             │ adversar.│             │ threshold│
+ │ resample │             │ reduction│             │ optim.   │
+ └──────────┘             └──────────┘             └──────────┘
+ Modify data              Modify training          Modify outputs
+ before training           objective directly       after inference
+```
+
+## How they complement each other
+
+```text
+┌─────────────────────────────────────────────────────┐
+│ YOUR ML PIPELINE                                    │
+│                                                     │
+│ ┌──────────┐       ┌─────────┐       ┌──────────┐   │
+│ │ Audit    │──────►│ Mitigate│──────►│ Monitor  │   │
+│ └────┬─────┘       └────┬────┘       └────┬─────┘   │
+│      │                  │                 │         │
+│ Fairlearn          AIF360 has         Fairlearn     │
+│ MetricFrame        more algos         dashboard     │
+│ (slicing)          to choose          (stakeholders)│
+└─────────────────────────────────────────────────────┘
+```
+
+A practical pattern many teams use:
+
+1. Fairlearn’s `MetricFrame` for clean, sklearn-friendly subgroup analysis — your fairness EDA.
+2. AIF360 when you need a specific metric or mitigation algorithm Fairlearn doesn’t offer (e.g., disparate impact remover, prejudice remover).
+3. Fairlearn’s dashboard for communicating findings to non-technical stakeholders (clinicians, IRB).
+
+## Why it matters for radiology AI
+
+For work at the Radiology AI Unit, typical sensitive attributes worth auditing are: sex, age band, BMI/body habitus, scanner manufacturer/model, and hospital site (especially for multi-center deployment). A standard fairness audit asks: does sensitivity and specificity stay within an acceptable ε across these strata? If not, you have a deployment risk that pure overall-AUC reporting will hide.
+
+In the AiSmartOps stack, AIF360 + Fairlearn should be treated as the fairness layer: Evidently can track tabular monitoring signals, [Alibi Detect](alibi_detect_aismartops_rundown.qmd) can detect image-aware drift/OOD behavior, and AIF360/Fairlearn answer the subgroup equity question directly.
