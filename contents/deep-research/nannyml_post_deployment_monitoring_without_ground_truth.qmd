@@ -102,10 +102,10 @@ That is especially useful when actual outcomes are delayed but operational aware
 
 ```text
 ┌──────────────────────┐     ┌──────────────────────┐
-│ Child Model          │     │ Nanny Model         │
-│ (your LVEF regressor)│ ─→  │ predicts loss of    │
-│ predicts y           │     │ child model         │
-└──────────────────────┘     └──────────┬──────────┘
+│ Child Model          │     │ Nanny Model          │
+│ (your LVEF regressor)│ ─→  │ predicts loss of     │
+│ predicts y           │     │ child model          │
+└──────────────────────┘     └───────────┬──────────┘
                                          │
                               Estimated RMSE / MAE
                               for live production data
@@ -156,7 +156,7 @@ From the broader monitoring architecture, NannyML is most useful when paired wit
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ PMS Monitoring Layer                                       │
+│ PMS Monitoring Layer                                        │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  ┌──────────────────┐        ┌──────────────────────────┐   │
@@ -169,8 +169,8 @@ From the broader monitoring architecture, NannyML is most useful when paired wit
 │  │   labels arrive  │        │                          │   │
 │  └──────────────────┘        └──────────────────────────┘   │
 │                                                             │
-│ Evidently says: distributions shifted.                     │
-│ NannyML says: here is how much that may hurt performance.  │
+│ Evidently says: distributions shifted.                      │
+│ NannyML says: here is how much that may hurt performance.   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```

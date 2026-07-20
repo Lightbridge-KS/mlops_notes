@@ -55,6 +55,10 @@ book:
           href: "contents/eval/evidently_aismartops_rundown.qmd"
         - text: "NannyML, Post-Deployment ML Monitoring Without Ground Truth"
           href: "contents/deep-research/nannyml_post_deployment_monitoring_without_ground_truth.qmd"
+    - part: Drift 
+      chapters: 
+        - text: Wasserstein Dist
+          href: "contents/monitoring/wasserstein_dist.qmd"
     - part: Image Drift & OOD Detection
       chapters:
         - text: "Alibi Detect — A Rundown for AiSmartOps"

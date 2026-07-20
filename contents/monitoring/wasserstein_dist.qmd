@@ -1,0 +1,110 @@
+---
+title: "Wasserstein distance"
+---
+
+Wasserstein distance is one of those ideas that's much more intuitive than its name suggests. Let me build it up from the ground.
+
+## The one-sentence version
+
+Wasserstein distance measures **how different two distributions are by asking: what's the minimum "effort" to reshape one into the other?** In drift detection, one distribution is your *reference* (usually training data) and the other is your *current* production data. A large distance = the data has moved away from what your model learned on.
+
+It's also called **Earth Mover's Distance (EMD)**, which is the metaphor that makes everything click.
+
+## The core intuition: moving piles of dirt
+
+Imagine each distribution as a pile of dirt sitting on a number line. Wasserstein distance is the minimum work to reshape the reference pile into the current pile, where:
+
+```
+        effort  =  amount of dirt moved  ×  how far you carry it
+```
+
+```
+  Reference pile              Current pile (target shape)
+
+     █                                        █
+     █   █                                █   █
+     █   █   █                        █   █   █
+    ─┴───┴───┴──                     ─┴───┴───┴──
+     1   2   3                        1   2   3
+
+   "What's the cheapest way to turn the LEFT into the RIGHT?"
+```
+
+## A concrete calculation
+
+Say both are on positions 1, 2, 3 (probabilities sum to 1):
+
+```
+  Position:      1      2      3
+  Reference:    0.5    0.3    0.2
+  Current:      0.2    0.3    0.5
+```
+
+Compare them bin by bin: position 1 has **0.3 too much**, position 3 is **0.3 short**, position 2 is balanced. So the optimal plan is one move — carry 0.3 of mass from position 1 to position 3:
+
+```
+  W₁ = (mass moved) × (distance) = 0.3 × |3 − 1| = 0.6
+```
+
+That's the whole idea. The "optimal transport plan" can get complex with many bins, but conceptually it's always *cost = mass × distance, minimized*.
+
+## The 1-D shortcut (what actually runs on a feature)
+
+For a single numeric feature, there's a beautiful closed form. The Wasserstein-1 distance equals the **area between the two CDFs** (cumulative distribution functions):
+
+$$W_1(P, Q) = \int |F_P(x) - F_Q(x)|\, dx$$
+
+```
+ prob
+ 1.0┤                 ●━━━━━━━━━━━
+    │            ┌────┘
+    │       ┌────┘   ← F_current (shifted right)
+    │   ┌───┘▒▒▒▒
+    │ ┌─┘▒▒▒▒         ▒▒ = area between the curves = W₁
+ 0.0┼─┘▒▒▒
+    └─────────────────────────► feature value
+        ▲
+     F_reference
+```
+
+This gives you the single most useful fact for building intuition:
+
+> **If the whole distribution just shifts right by δ, then W₁ = δ — exactly.**
+
+So the distance comes out **in the feature's own units**. If mean HU on a CT feature drifts by 15 units, that shows up directly. That interpretability is a real advantage in a clinical setting where you want to explain drift to non-ML colleagues.
+
+## Why Wasserstein instead of KL / JS divergence?
+
+This is the "aha" that develops deep understanding. Consider three spikes:
+
+```
+   P        Q                                   R
+   █        █                                   █
+  ─┴────────┴───────────────────────────────────┴──►
+   0        1                                  10
+
+  Wasserstein:   W(P,Q) = 1        W(P,R) = 10
+     → "R is 10× further from P than Q is"     ✓ matches intuition
+
+  KL / JS:       none of these overlap at all
+     → KL blows up to ∞  (JS saturates at log 2)  for BOTH pairs
+     → can't tell "small drift" apart from "huge drift"   ✗
+```
+
+KL and Jensen-Shannon are **vertical / bin-aligned** comparisons — they only look at whether mass sits at the *same* location. When distributions barely overlap (common with real drift), they either explode or flatten out and lose resolution.
+
+Wasserstein is **horizontal** — it accounts for *how far* the mass had to travel through the feature space. That geometric awareness is exactly what you want for a graded "how much has this drifted?" signal.
+
+```
+  KL / JS ask:  "Is the mass in the same buckets?"   (yes/no-ish)
+  Wasserstein asks: "How far did the mass have to move?" (a real distance)
+```
+
+## How Evidently AI wires it up
+
+Conceptually, Evidently runs drift *per column* and picks a method by data type and volume. For numerical features on larger datasets it reaches for Wasserstein, with two practical touches:
+
+- **Normalization** — it divides the raw Wasserstein distance by the reference distribution's standard deviation, so the metric becomes scale-free and comparable across features (a distance of "0.1" then means roughly "the mass moved about 0.1 std-devs' worth of effort").
+- **A threshold** — above some cutoff, the column is flagged as drifted.
+
+The exact default method-selection rules and threshold values are version-dependent, so if you want, I can pull the current Evidently docs and confirm the precise defaults (method-switching by sample size, the numeric threshold, categorical handling) rather than me quoting a possibly-stale number.
